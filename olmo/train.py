@@ -874,6 +874,7 @@ class Trainer:
             self.gumbel_manager = GumbelMaskManager(
                 n_layers=self.cfg.model.n_layers,
                 mlp_dim=mlp_dim,
+                init_scale=self.cfg.hmat.gumbel_init_scale,
             ).to(self.device)
 
             # Register with MatformerManager

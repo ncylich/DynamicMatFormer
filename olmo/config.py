@@ -469,6 +469,7 @@ class HMatConfig(BaseConfig):
     gumbel_tau_anneal_steps: int = 0  # 0 = use max_duration
     budget_penalty_lambda: float = 0.01
     budget_penalty_target: float = 0.5
+    gumbel_init_scale: float = 1.1  # linspace(+scale, -scale) → sigmoid range [~0.25, ~0.75]
 
 
 @dataclass

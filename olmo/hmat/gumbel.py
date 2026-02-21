@@ -60,11 +60,11 @@ class GumbelMaskLayer(nn.Module):
 class GumbelMaskManager(nn.Module):
     """Manages Gumbel masks for all layers in the model."""
 
-    def __init__(self, n_layers: int, mlp_dim: int):
+    def __init__(self, n_layers: int, mlp_dim: int, init_scale: float = 2.2):
         super().__init__()
         self.n_layers = n_layers
         self.mlp_dim = mlp_dim
-        self.masks = nn.ModuleList([GumbelMaskLayer(mlp_dim) for _ in range(n_layers)])
+        self.masks = nn.ModuleList([GumbelMaskLayer(mlp_dim, init_scale=init_scale) for _ in range(n_layers)])
 
     def get_mask(self, layer_idx: int, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
         """Get the mask for a specific layer."""
