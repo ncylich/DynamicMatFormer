@@ -17,14 +17,22 @@ import torch.nn as nn
 class GumbelMaskLayer(nn.Module):
     """Per-layer learnable importance gate using Gumbel-Sigmoid."""
 
-    def __init__(self, mlp_dim: int, init_scale: float = 2.2):
+    def __init__(self, mlp_dim: int, init_scale: float = 2.2, learnable: bool = True):
         super().__init__()
         self.mlp_dim = mlp_dim
         # Linear decay: first dims get positive logits (always on),
         # last dims get negative logits (usually off).
-        # sigmoid(2.2)≈0.9, sigmoid(-2.2)≈0.1, mean≈0.5 (matches typical budget target).
-        # This makes initial sub-model slicing match baseline MatFormer behavior.
-        self.logits = nn.Parameter(torch.linspace(init_scale, -init_scale, mlp_dim))
+        init_logits = torch.linspace(init_scale, -init_scale, mlp_dim)
+        if learnable:
+            self.logits = nn.Parameter(init_logits)
+        else:
+            # Register as buffer — not a parameter, not in optimizer
+            self.register_buffer("logits", init_logits)
+
+    def set_logits(self, new_logits: torch.Tensor):
+        """Update logits from external source (e.g., Fisher EMA)."""
+        with torch.no_grad():
+            self.logits.copy_(new_logits)
 
     def forward(self, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
         """
@@ -60,11 +68,14 @@ class GumbelMaskLayer(nn.Module):
 class GumbelMaskManager(nn.Module):
     """Manages Gumbel masks for all layers in the model."""
 
-    def __init__(self, n_layers: int, mlp_dim: int, init_scale: float = 2.2):
+    def __init__(self, n_layers: int, mlp_dim: int, init_scale: float = 2.2, learnable: bool = True):
         super().__init__()
         self.n_layers = n_layers
         self.mlp_dim = mlp_dim
-        self.masks = nn.ModuleList([GumbelMaskLayer(mlp_dim, init_scale=init_scale) for _ in range(n_layers)])
+        self.masks = nn.ModuleList([
+            GumbelMaskLayer(mlp_dim, init_scale=init_scale, learnable=learnable)
+            for _ in range(n_layers)
+        ])
 
     def get_mask(self, layer_idx: int, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
         """Get the mask for a specific layer."""

@@ -795,3 +795,282 @@ The gumbel mechanism successfully **learns heterogeneous per-layer allocation** 
 4. The budget penalty, even at lambda=0.001, adds a competing objective
 
 **Expected improvements at larger scale:** The gap should narrow or reverse because (a) more layers means more allocation flexibility, (b) the per-layer sensitivity U-shape is more pronounced, (c) the relative overhead of mask parameters becomes negligible, and (d) the model has more capacity to absorb the regularization effect.
+
+### Critical Fix: Linear Decay Initialization
+
+**Root cause of the original gap:** Zero-initialized logits produce `sigmoid(0)=0.5` masks, which **halves effective capacity at every sub-model width from step 1**. Combined with MatFormer's factor loop, the gumbel model trains at 2x more compression than baseline at every factor.
+
+**Fix:** Initialize logits with `torch.linspace(+2.2, -2.2, mlp_dim)` so initial masks approximate baseline MatFormer's hard slicing (early dims ~0.9, late dims ~0.1, mean ~0.5).
+
+**540-step results with linear decay init (tau=0.5, lambda=0.001):**
+
+| Sub-model | Baseline | Gumbel (zero init) | Gumbel (linear decay) |
+|-----------|---------|--------------------|-----------------------|
+| Full (1/1) | **155.9** | 174.0 (+11.6%) | **160.0** (+2.6%) |
+| 1/2 | 161.8 | — | **160.2** (-1.0%) |
+| 1/4 | 167.2 | — | **164.8** (-1.4%) |
+| 1/8 | 172.9 | — | **170.6** (-1.3%) |
+
+Linear decay closes the gap from 11.6% to 2.6% at full width, and **outperforms baseline at all compressed sub-models**.
+
+**2700-step results with linear decay init:**
+
+| Sub-model | Baseline | Gumbel (linear decay) | Delta |
+|-----------|---------|----------------------|-------|
+| Full (1/1) | **381.1** | 415.5 | +9.0% |
+| 1/2 | **410.5** | 428.4 | +4.4% |
+| 1/4 | **445.7** | 460.7 | +3.4% |
+| 1/8 | **489.1** | 500.5 | +2.3% |
+
+The gap **narrows monotonically** at higher compression (9% → 4.4% → 3.4% → 2.3%), confirming that heterogeneous allocation helps most where it matters: under aggressive compression.
+
+**Learned mask analysis (2700 steps):**
+- Layer 0: 1292/2048 active (63%), logit mean +0.48 — widest
+- Layer 1: 1163/2048 (57%), logit mean +0.26
+- Layer 2: 980/2048 (48%), logit mean -0.27
+- Layer 3: 840/2048 (41%), logit mean -0.65 — narrowest
+- **97-99% of top dimensions preserved their initial ordering** (layers 0-2)
+- Layer 3 showed more reordering (86% top-256 overlap), learning layer-specific importance
+- The masks primarily learn **per-layer width thresholds**, not per-dimension reordering — the MatFormer nesting already provides a good dimension ordering
+
+---
+
+## Phase 2.5: Fisher-Guided Gumbel Masking (Saliency-Driven Allocation)
+
+### Motivation
+
+Phase 2's core weakness: Gumbel logits are learned via backprop through a budget penalty — an indirect, competing objective that degrades the primary language modeling loss, especially over longer training. The logits converge slowly and the soft masks reduce effective capacity throughout training.
+
+**Key insight:** We can compute Fisher saliency scores from the gradients we already have (zero extra cost), and use them to *directly set* the Gumbel logits. This replaces the learned-logit + budget-penalty mechanism with a direct importance signal, while retaining Gumbel noise for exploration.
+
+### How It Differs from Phase 2
+
+| Aspect | Phase 2 (Learned Gumbel) | Phase 2.5 (Fisher-Guided Gumbel) |
+|--------|--------------------------|----------------------------------|
+| Logit source | Learned via backprop + budget penalty | Set from Fisher saliency EMA |
+| Mask parameters | Learnable `nn.Parameter` | Non-learnable, externally updated |
+| Budget penalty | Required (competing objective) | **Eliminated** |
+| Second optimizer | Required for mask params | **Eliminated** |
+| Exploration | Gumbel noise + temperature | Gumbel noise + temperature (same) |
+| Logit polarization | Gradual, learned over training | Strong from start (saliency is informative) |
+
+### Algorithm
+
+```
+Phase 1: Warmup (steps 0..W)
+  - Train standard uniform MatFormer (no masks applied)
+  - Each step after backward: accumulate per-dimension Fisher scores into EMA
+    fisher_ema[l][d] = beta * fisher_ema[l][d] + (1 - beta) * (grad[l][d] ** 2).sum()
+  - Purpose: build stable saliency estimates before masking begins
+
+Phase 2: Fisher-guided masking (steps W..end)
+  - Every K steps: convert Fisher EMA to Gumbel logits
+    1. For each layer l, rank dimensions by fisher_ema[l]
+    2. Map ranks to logits: logits[l] = linspace(+scale, -scale, mlp_dim)[rank_order]
+       (top-saliency dims get positive logits, bottom get negative)
+    3. Update the GumbelMaskLayer logits (non-gradient, direct assignment)
+  - Each forward pass: apply Gumbel-Sigmoid masks with temperature annealing
+    mask = sigmoid((logits + gumbel_noise) / tau)
+  - Continue accumulating Fisher EMA (masked-out dims still occasionally
+    activate via Gumbel noise, keeping their saliency scores calibrated)
+  - Temperature annealing: tau high early (exploration) → low late (exploitation)
+
+Phase 3: Freeze (final)
+  - Convert soft masks to hard {0,1} based on final logits
+  - Extract per-layer widths, snap to nearest MatFormer factors
+```
+
+### Why Gumbel Noise Still Matters (Exploration)
+
+Without noise, Fisher-guided hard masking creates a rich-get-richer problem: dimensions that score high early monopolize gradient signal, reinforcing their scores even if other dimensions would ultimately be more useful. Gumbel noise + temperature provides exploration:
+
+- **Early training (high tau):** Masks are stochastic — dimensions with low saliency still activate frequently, receive gradient signal, and their Fisher scores stay calibrated. If a masked-out dimension becomes important later, its saliency rises and the periodic logit update catches it.
+- **Late training (low tau):** Masks converge toward the saliency-derived allocation. The model has had time to explore and the Fisher EMA is stable.
+
+This is the same Gumbel-Sigmoid + temperature annealing infrastructure from Phase 2, but with externally-set logits instead of learned ones.
+
+### Design Decisions
+
+1. **Warmup period (W):** ~5-10% of total training steps. Needs to be long enough for Fisher EMA to stabilize, short enough that masking has time to take effect. Start with W = max_duration * 0.05.
+
+2. **EMA decay (beta):** 0.99 — slow enough for stability, fast enough to track changing saliency as the model trains. Fisher scores from early training (random weights) are very different from mid-training scores.
+
+3. **Logit update frequency (K):** Every 50-100 steps. Too frequent = noisy allocation changes that destabilize training. Too infrequent = slow adaptation. The knapsack solver runs in microseconds so compute cost is zero.
+
+4. **Logit scale:** Reuse init_scale from Phase 2 (default 2.2). `linspace(+2.2, -2.2)` maps top-saliency dims to sigmoid ≈ 0.9, bottom to ≈ 0.1. The rank-based mapping ensures consistent polarization regardless of raw saliency magnitude.
+
+5. **Fisher score computation:** Per-dimension, summing squared gradients from both `ff_proj` rows and `ff_out` columns (same formula as Phase 1's `compute_fisher_saliency`). Computed from gradients that already exist after backward — zero extra forward/backward passes.
+
+### 2.5.1 Fisher EMA Accumulator
+
+**File:** `olmo/hmat/fisher_ema.py` (new)
+
+```python
+class FisherEMA:
+    """
+    Exponential moving average of per-dimension Fisher saliency scores.
+    Updated each training step from existing gradients (zero extra compute).
+    """
+
+    def __init__(self, n_layers: int, mlp_dim: int, beta: float = 0.99,
+                 device: torch.device = None):
+        self.n_layers = n_layers
+        self.mlp_dim = mlp_dim
+        self.beta = beta
+        # EMA accumulators: one vector per layer
+        self.scores = [torch.zeros(mlp_dim, device=device) for _ in range(n_layers)]
+        self.steps = 0
+
+    def update(self, model: nn.Module):
+        """
+        Accumulate Fisher scores from current gradients (call after backward).
+        """
+        self.steps += 1
+        for l, block in enumerate(model.transformer.blocks):
+            grad_proj = block.ff_proj.weight.grad  # (mlp_dim, d_model)
+            grad_out = block.ff_out.weight.grad     # (d_model, mlp_dim)
+            if grad_proj is None or grad_out is None:
+                continue
+            fisher = (grad_proj ** 2).sum(dim=1) + (grad_out ** 2).sum(dim=0)
+            self.scores[l] = self.beta * self.scores[l] + (1 - self.beta) * fisher.detach()
+
+    def get_logits(self, scale: float = 2.2) -> List[torch.Tensor]:
+        """
+        Convert Fisher EMA scores to Gumbel logits via rank-based mapping.
+
+        Dimensions are ranked by saliency within each layer. Top-ranked dims
+        get positive logits (+scale), bottom-ranked get negative (-scale).
+        """
+        logits = []
+        for l in range(self.n_layers):
+            # Rank dimensions by saliency (highest = rank 0)
+            ranks = self.scores[l].argsort(descending=True).argsort()
+            # Map ranks to logits: rank 0 → +scale, rank mlp_dim-1 → -scale
+            layer_logits = scale - (2 * scale * ranks.float() / (self.mlp_dim - 1))
+            logits.append(layer_logits)
+        return logits
+```
+
+### 2.5.2 Modify GumbelMaskLayer for External Logit Updates
+
+**File:** `olmo/hmat/gumbel.py` (modify)
+
+The existing `GumbelMaskLayer` stores logits as `nn.Parameter`. For Phase 2.5, logits are set externally and should **not** be learnable:
+
+```python
+class GumbelMaskLayer(nn.Module):
+    def __init__(self, mlp_dim: int, init_scale: float = 2.2, learnable: bool = True):
+        super().__init__()
+        self.mlp_dim = mlp_dim
+        init_logits = torch.linspace(init_scale, -init_scale, mlp_dim)
+        if learnable:
+            self.logits = nn.Parameter(init_logits)
+        else:
+            # Register as buffer — not a parameter, not in optimizer
+            self.register_buffer("logits", init_logits)
+
+    def set_logits(self, new_logits: torch.Tensor):
+        """Update logits from external source (e.g., Fisher EMA)."""
+        with torch.no_grad():
+            self.logits.copy_(new_logits)
+```
+
+The forward pass (Gumbel-Sigmoid + temperature) remains identical.
+
+### 2.5.3 Integrate into Training Loop
+
+**File:** `olmo/train.py` (modify)
+
+```python
+# In Trainer.__init__ or init_gumbel():
+if self.cfg.hmat.method == "fisher_gumbel":
+    mlp_dim = self.cfg.model.mlp_ratio * self.cfg.model.d_model
+    n_layers = self.cfg.model.n_layers
+
+    # Fisher EMA accumulator
+    self.fisher_ema = FisherEMA(
+        n_layers=n_layers,
+        mlp_dim=int(mlp_dim * output_multiplier),
+        beta=self.cfg.hmat.fisher_ema_beta,
+        device=self.device,
+    )
+
+    # Gumbel masks with non-learnable logits
+    self.gumbel_manager = GumbelMaskManager(
+        n_layers=n_layers,
+        mlp_dim=int(mlp_dim * output_multiplier),
+        init_scale=self.cfg.hmat.gumbel_init_scale,
+        learnable=False,  # NEW: logits are buffers, not parameters
+    )
+    # No second optimizer needed!
+
+    matmng.mode = "gumbel"
+    matmng.gumbel_masks = self.gumbel_manager
+    matmng.gumbel_tau = self.cfg.hmat.gumbel_tau_start
+
+# In train_step(), after backward but before optimizer.step():
+if self.cfg.hmat.method == "fisher_gumbel":
+    # 1. Accumulate Fisher EMA (uses existing gradients — free)
+    self.fisher_ema.update(self.fsdp_model.module)
+
+    # 2. During warmup: no masks applied (handled by checking step < warmup)
+    warmup_steps = int(self.cfg.hmat.fisher_warmup_frac * self.cfg.max_duration)
+
+    if self.global_step == warmup_steps:
+        # First time: enable masking
+        matmng.mode = "gumbel"
+
+    # 3. Every K steps after warmup: update logits from Fisher EMA
+    if (self.global_step >= warmup_steps and
+            self.global_step % self.cfg.hmat.fisher_update_interval == 0):
+        new_logits = self.fisher_ema.get_logits(scale=self.cfg.hmat.gumbel_init_scale)
+        for i, mask_layer in enumerate(self.gumbel_manager.masks):
+            mask_layer.set_logits(new_logits[i])
+
+    # 4. Temperature annealing (same as Phase 2)
+    # ...
+```
+
+### 2.5.4 Config Extensions
+
+**File:** `olmo/config.py` (modify `HMatConfig`)
+
+```python
+@dataclass
+class HMatConfig(BaseConfig):
+    # ... existing fields ...
+    method: str = "fisher"  # "fisher" | "gumbel" | "fisher_gumbel"
+
+    # Phase 2.5 (Fisher-Guided Gumbel) settings
+    fisher_ema_beta: float = 0.99           # EMA decay for Fisher scores
+    fisher_warmup_frac: float = 0.05        # Fraction of training for warmup (no masks)
+    fisher_update_interval: int = 50        # Update logits from Fisher EMA every K steps
+```
+
+### 2.5.5 Forward Pass
+
+**No changes needed.** The existing `OlmoSequentialBlock.forward` already handles gumbel masks via `matmng.mode == "gumbel"`. During warmup, `matmng.mode` stays `"uniform"` so masks aren't applied. After warmup, it switches to `"gumbel"` and the same mask application logic runs.
+
+### Tests for Phase 2.5
+
+**File:** `tests/test_fisher_gumbel.py` (new)
+
+1. **test_fisher_ema_accumulation:** Run 10 forward-backward passes, verify EMA scores are non-zero and shaped correctly.
+2. **test_fisher_ema_decay:** Verify that old scores decay with beta and new scores are incorporated.
+3. **test_fisher_ema_to_logits:** Set known saliency scores, verify rank-based logit mapping produces correct ordering (+scale for top dims, -scale for bottom).
+4. **test_logit_update_preserves_mask_shape:** After `set_logits()`, verify forward pass still produces correct mask shape.
+5. **test_warmup_no_masks:** During warmup steps, verify model forward pass is identical to uniform MatFormer.
+6. **test_exploration_via_gumbel_noise:** With high tau, verify that low-saliency dimensions still activate with meaningful probability (> 5%).
+7. **test_convergence_at_low_tau:** With low tau, verify masks closely match the saliency ranking.
+8. **test_fisher_gumbel_end_to_end:** Run a short training loop (warmup + masked steps), verify no errors and that logits change across Fisher updates.
+9. **test_no_learnable_mask_params:** Verify `gumbel_manager.parameters()` is empty when `learnable=False`.
+10. **test_fisher_ema_with_masking:** Verify that Fisher scores still accumulate correctly even when masks are active (masked-out dims get nonzero scores via Gumbel exploration).
+
+### Expected Advantages Over Phase 2
+
+1. **No competing objective:** Budget penalty eliminated — the only loss is language modeling.
+2. **No second optimizer:** Mask logits are buffers, not parameters.
+3. **Stronger logit polarization:** Fisher saliency provides a direct importance signal; masks are near-binary from the moment masking begins (after warmup).
+4. **Adaptive allocation:** Fisher EMA tracks changing importance over training — allocation isn't frozen at initialization.
+5. **Warmup eliminates early-training capacity loss:** The model trains at full capacity during warmup, building both good weights and stable saliency estimates before any masking.
+6. **Exploration prevents lock-in:** Gumbel noise ensures masked-out dimensions still occasionally activate, keeping Fisher scores calibrated and allowing allocation to shift if importance changes.

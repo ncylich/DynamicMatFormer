@@ -32,6 +32,7 @@ from .config import CheckpointType, SpeedMonitorConfig, TrainConfig
 from .data import IterableDataset
 from .eval import Evaluator
 from .exceptions import OlmoConfigurationError
+from .hmat.fisher_ema import FisherEMA
 from .hmat.gumbel import GumbelMaskManager
 from .model import Olmo, MatformerManager
 from .optim import set_new_base_lr
@@ -106,6 +107,7 @@ class Trainer:
     z_train_loss_metric: Optional[MeanMetric] = None
     gumbel_manager: Optional[GumbelMaskManager] = None
     gumbel_optim: Optional[torch.optim.Optimizer] = None
+    fisher_ema: Optional[FisherEMA] = None
     global_step: int = 0
     global_data_step: int = 0
     """This is now redundant since adding 'global_train_examples_seen'."""
@@ -618,14 +620,25 @@ class Trainer:
         batch = move_to_device(batch, self.device)
 
         # Update Gumbel temperature if in gumbel mode.
-        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
-            anneal_steps = self.cfg.hmat.gumbel_tau_anneal_steps or self.cfg.max_duration
-            progress = min(1.0, self.global_step / anneal_steps)
-            tau_start = self.cfg.hmat.gumbel_tau_start
-            tau_end = self.cfg.hmat.gumbel_tau_end
-            tau = tau_start * (tau_end / tau_start) ** progress
+        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method in ("gumbel", "fisher_gumbel"):
             matmng = MatformerManager.get_instance()
-            matmng.gumbel_tau = tau
+
+            # Check if we should freeze masks (last X% of training)
+            freeze_frac = self.cfg.hmat.gumbel_freeze_fraction
+            frozen = freeze_frac > 0 and self.global_step > self.cfg.max_duration * (1 - freeze_frac)
+
+            if frozen:
+                # Freeze: stop gumbel optimizer, force hard masks via very low tau
+                matmng.gumbel_tau = 0.001
+                if self.gumbel_optim is not None:
+                    self.gumbel_optim = None  # Stop updating mask logits
+            else:
+                anneal_steps = self.cfg.hmat.gumbel_tau_anneal_steps or self.cfg.max_duration
+                progress = min(1.0, self.global_step / anneal_steps)
+                tau_start = self.cfg.hmat.gumbel_tau_start
+                tau_end = self.cfg.hmat.gumbel_tau_end
+                tau = tau_start * (tau_end / tau_start) ** progress
+                matmng.gumbel_tau = tau
 
         # Run forward-backward pass.
 
@@ -651,6 +664,27 @@ class Trainer:
             self.ce_train_loss_metric.update(ce_batch_loss)
             ce_batch_loss = self.ce_train_loss_metric.compute()
             losses.append((ce_batch_loss, z_batch_loss))
+
+        # Fisher EMA update (Phase 2.5): accumulate from existing gradients before optimizer step
+        if self.fisher_ema is not None and self.cfg.hmat.method == "fisher_gumbel":
+            # Access the unwrapped model for gradient access
+            unwrapped = self.fsdp_model.module if hasattr(self.fsdp_model, 'module') else self.fsdp_model
+            self.fisher_ema.update(unwrapped)
+
+            warmup_steps = int(self.cfg.hmat.fisher_warmup_frac * self.cfg.max_duration)
+
+            # After warmup: enable gumbel masking
+            if self.global_step == warmup_steps:
+                matmng = MatformerManager.get_instance()
+                matmng.mode = "gumbel"
+                log.info(f"Fisher-Gumbel warmup complete at step {self.global_step}, enabling masks")
+
+            # Periodically update logits from Fisher EMA
+            if (self.global_step >= warmup_steps and
+                    self.global_step % self.cfg.hmat.fisher_update_interval == 0):
+                new_logits = self.fisher_ema.get_logits(scale=self.cfg.hmat.gumbel_init_scale)
+                for i, mask_layer in enumerate(self.gumbel_manager.masks):
+                    mask_layer.set_logits(new_logits[i])
 
         # Clip gradient norms.
         grad_norm: Optional[float] = None
@@ -867,30 +901,49 @@ class Trainer:
 
     def init_gumbel(self):
         """Initialize Gumbel mask manager if configured."""
-        if self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
-            from .model import Activation
-            act = Activation.build(self.cfg.model)
-            mlp_dim = int(self.cfg.model.mlp_ratio * self.cfg.model.d_model * act.output_multiplier)
-            self.gumbel_manager = GumbelMaskManager(
+        if not self.cfg.hmat.enabled or self.cfg.hmat.method not in ("gumbel", "fisher_gumbel"):
+            return
+
+        from .model import Activation
+        act = Activation.build(self.cfg.model)
+        mlp_dim = int(self.cfg.model.mlp_ratio * self.cfg.model.d_model * act.output_multiplier)
+        is_fisher = self.cfg.hmat.method == "fisher_gumbel"
+
+        self.gumbel_manager = GumbelMaskManager(
+            n_layers=self.cfg.model.n_layers,
+            mlp_dim=mlp_dim,
+            init_scale=self.cfg.hmat.gumbel_init_scale,
+            learnable=not is_fisher,  # Fisher-guided: logits are buffers, not parameters
+        ).to(self.device)
+
+        matmng = MatformerManager.get_instance()
+        matmng.gumbel_masks = self.gumbel_manager
+        matmng.gumbel_tau = self.cfg.hmat.gumbel_tau_start
+
+        if is_fisher:
+            # Phase 2.5: Fisher-guided — start in uniform mode during warmup
+            matmng.mode = "uniform"
+            self.fisher_ema = FisherEMA(
                 n_layers=self.cfg.model.n_layers,
                 mlp_dim=mlp_dim,
-                init_scale=self.cfg.hmat.gumbel_init_scale,
-            ).to(self.device)
-
-            # Register with MatformerManager
-            matmng = MatformerManager.get_instance()
+                beta=self.cfg.hmat.fisher_ema_beta,
+                device=self.device,
+            )
+            # No second optimizer needed
+            log.info(
+                f"Initialized Fisher-Guided Gumbel: {self.cfg.model.n_layers} layers, "
+                f"mlp_dim={mlp_dim}, warmup={self.cfg.hmat.fisher_warmup_frac}, "
+                f"update_interval={self.cfg.hmat.fisher_update_interval}"
+            )
+        else:
+            # Phase 2: Learned gumbel
             matmng.mode = "gumbel"
-            matmng.gumbel_masks = self.gumbel_manager
-            matmng.gumbel_tau = self.cfg.hmat.gumbel_tau_start
-
-            # Use a separate optimizer for gumbel params (avoids FSDP optim_state_dict issues)
             self.gumbel_optim = torch.optim.AdamW(
                 self.gumbel_manager.parameters(),
                 lr=self.cfg.optimizer.learning_rate,
                 weight_decay=0.0,
                 betas=tuple(self.cfg.optimizer.betas),
             )
-
             log.info(
                 f"Initialized GumbelMaskManager: {self.cfg.model.n_layers} layers, "
                 f"mlp_dim={mlp_dim}, target={self.cfg.hmat.budget_penalty_target}, "

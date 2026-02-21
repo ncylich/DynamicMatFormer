@@ -470,6 +470,12 @@ class HMatConfig(BaseConfig):
     budget_penalty_lambda: float = 0.01
     budget_penalty_target: float = 0.5
     gumbel_init_scale: float = 1.1  # linspace(+scale, -scale) → sigmoid range [~0.25, ~0.75]
+    gumbel_freeze_fraction: float = 0.0  # Freeze masks + switch to hard for last X% of training
+
+    # Phase 2.5 (Fisher-Guided Gumbel) settings
+    fisher_ema_beta: float = 0.99
+    fisher_warmup_frac: float = 0.05  # Fraction of training for warmup (no masks)
+    fisher_update_interval: int = 50  # Update logits from Fisher EMA every K steps
 
 
 @dataclass
