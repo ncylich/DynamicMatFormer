@@ -32,6 +32,7 @@ from .config import CheckpointType, SpeedMonitorConfig, TrainConfig
 from .data import IterableDataset
 from .eval import Evaluator
 from .exceptions import OlmoConfigurationError
+from .hmat.gumbel import GumbelMaskManager
 from .model import Olmo, MatformerManager
 from .optim import set_new_base_lr
 from .util import (
@@ -103,6 +104,8 @@ class Trainer:
     evaluators: List[Evaluator]
     ce_train_loss_metric: MeanMetric
     z_train_loss_metric: Optional[MeanMetric] = None
+    gumbel_manager: Optional[GumbelMaskManager] = None
+    gumbel_optim: Optional[torch.optim.Optimizer] = None
     global_step: int = 0
     global_data_step: int = 0
     """This is now redundant since adding 'global_train_examples_seen'."""
@@ -120,6 +123,10 @@ class Trainer:
         state_dict = self.non_tensor_state_dict()
         state_dict["model"] = self.fsdp_model.state_dict()
         state_dict["optim"] = FSDP.optim_state_dict(self.fsdp_model, self.optim)
+        if self.gumbel_manager is not None:
+            state_dict["gumbel_manager"] = self.gumbel_manager.state_dict()
+        if self.gumbel_optim is not None:
+            state_dict["gumbel_optim"] = self.gumbel_optim.state_dict()
         return state_dict
 
     def non_tensor_state_dict(self) -> Dict[str, Any]:
@@ -403,6 +410,11 @@ class Trainer:
             if get_global_rank() == 0:
                 torch.save(other_state_dict, checkpoint_dir_tmp / "other.pt")
                 self.cfg.save(checkpoint_dir_tmp / "config.yaml")
+                # Save Gumbel mask state if present.
+                if self.gumbel_manager is not None:
+                    torch.save(self.gumbel_manager.state_dict(), checkpoint_dir_tmp / "gumbel.pt")
+                if self.gumbel_optim is not None:
+                    torch.save(self.gumbel_optim.state_dict(), checkpoint_dir_tmp / "gumbel_optim.pt")
             barrier()
 
         if get_global_rank() == 0:
@@ -570,6 +582,11 @@ class Trainer:
                 else:
                     loss = ce_loss
 
+                # Add Gumbel budget penalty.
+                if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
+                    budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
+                    loss = loss + self.cfg.hmat.budget_penalty_lambda * budget_penalty / len(micro_batches)
+
                 del logits
 
             # Check for nan.
@@ -589,6 +606,8 @@ class Trainer:
 
         # Zero-gradients.
         self.optim.zero_grad(set_to_none=True)
+        if self.gumbel_optim is not None:
+            self.gumbel_optim.zero_grad(set_to_none=True)
 
         # Reset metrics.
         self.ce_train_loss_metric.reset()
@@ -597,6 +616,16 @@ class Trainer:
 
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)
+
+        # Update Gumbel temperature if in gumbel mode.
+        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
+            anneal_steps = self.cfg.hmat.gumbel_tau_anneal_steps or self.cfg.max_duration
+            progress = min(1.0, self.global_step / anneal_steps)
+            tau_start = self.cfg.hmat.gumbel_tau_start
+            tau_end = self.cfg.hmat.gumbel_tau_end
+            tau = tau_start * (tau_end / tau_start) ** progress
+            matmng = MatformerManager.get_instance()
+            matmng.gumbel_tau = tau
 
         # Run forward-backward pass.
 
@@ -631,6 +660,8 @@ class Trainer:
         # Optimizer step.
         self.optim.step()
         self.scheduler.step()
+        if self.gumbel_optim is not None:
+            self.gumbel_optim.step()
 
         if len(losses) > 1:
             metrics = {}
@@ -654,6 +685,14 @@ class Trainer:
 
         if grad_norm is not None:
             metrics["optim/grad_norm"] = grad_norm
+
+        # Log Gumbel metrics.
+        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
+            metrics.update(self.gumbel_manager.log_summary())
+            matmng = MatformerManager.get_instance()
+            metrics["gumbel/tau"] = matmng.gumbel_tau
+            budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
+            metrics["gumbel/budget_penalty"] = budget_penalty.item()
 
         # Update min train loss and see if we should stop early.
         self.min_train_loss = min(self.min_train_loss, ce_batch_loss.item())  # type: ignore
@@ -826,8 +865,42 @@ class Trainer:
 
         return eval_metrics
 
+    def init_gumbel(self):
+        """Initialize Gumbel mask manager if configured."""
+        if self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
+            from .model import Activation
+            act = Activation.build(self.cfg.model)
+            mlp_dim = int(self.cfg.model.mlp_ratio * self.cfg.model.d_model * act.output_multiplier)
+            self.gumbel_manager = GumbelMaskManager(
+                n_layers=self.cfg.model.n_layers,
+                mlp_dim=mlp_dim,
+            ).to(self.device)
+
+            # Register with MatformerManager
+            matmng = MatformerManager.get_instance()
+            matmng.mode = "gumbel"
+            matmng.gumbel_masks = self.gumbel_manager
+            matmng.gumbel_tau = self.cfg.hmat.gumbel_tau_start
+
+            # Use a separate optimizer for gumbel params (avoids FSDP optim_state_dict issues)
+            self.gumbel_optim = torch.optim.AdamW(
+                self.gumbel_manager.parameters(),
+                lr=self.cfg.optimizer.learning_rate,
+                weight_decay=0.0,
+                betas=tuple(self.cfg.optimizer.betas),
+            )
+
+            log.info(
+                f"Initialized GumbelMaskManager: {self.cfg.model.n_layers} layers, "
+                f"mlp_dim={mlp_dim}, target={self.cfg.hmat.budget_penalty_target}, "
+                f"lambda={self.cfg.hmat.budget_penalty_lambda}"
+            )
+
     def fit(self):
         start_time = time.time()
+
+        # Initialize Gumbel masks if configured.
+        self.init_gumbel()
 
         if self.cfg.load_path is not None and self.global_step > 0 and self.cfg.eval_on_load:
             eval_metrics = self.eval()

@@ -443,8 +443,19 @@ class OlmoSequentialBlock(OlmoBlock):
         # Add feed-forward projection.
         # shape: (batch_size, seq_len, d_model)
         factor = self.matmng.get_factor_for_layer(self.layer_idx)
+        use_gumbel = self.matmng.mode == "gumbel" and self.matmng.gumbel_masks is not None
+
+        if use_gumbel:
+            tau = self.matmng.gumbel_tau
+            mask = self.matmng.gumbel_masks.get_mask(
+                self.layer_idx, tau=tau, hard=not self.training
+            )
+
         if factor == 1:
-            x = x + self.dropout(self.ff_out(self.act(self.ff_proj(self.ff_norm(x)))))
+            h = self.act(self.ff_proj(self.ff_norm(x)))
+            if use_gumbel:
+                h = h * mask.unsqueeze(0).unsqueeze(0)
+            x = x + self.dropout(self.ff_out(h))
         else:
             n = self.ff_proj.weight.shape[0]
             k = int(n / factor)
@@ -455,7 +466,11 @@ class OlmoSequentialBlock(OlmoBlock):
             w_out = self.ff_out.weight[:, :k_out]
             b_out = self.ff_out.bias
 
-            x = x + self.dropout(F.linear(self.act(F.linear(self.ff_norm(x), w_proj, b_proj)), w_out, b_out))
+            h = self.act(F.linear(self.ff_norm(x), w_proj, b_proj))
+            if use_gumbel:
+                # Slice mask to match the sub-model width (preserves nesting)
+                h = h * mask[:k_out].unsqueeze(0).unsqueeze(0)
+            x = x + self.dropout(F.linear(h, w_out, b_out))
 
         return x, cache
 
