@@ -47,7 +47,11 @@ class MatformerManager:
         raise RuntimeError("Call get_instance() instead")
 
     def initialize(self):
-        self.current_factor = 1
+        self.current_factor = 1            # Backward-compat: uniform factor
+        self.layer_factors = None          # Dict[int, int] or None: per-layer factors
+        self.mode = "uniform"              # "uniform" | "heterogeneous" | "gumbel"
+        self.gumbel_masks = None           # For Method B: per-layer soft masks
+        self.gumbel_tau = 1.0              # Current Gumbel temperature
 
     @classmethod
     def get_instance(cls):
@@ -55,6 +59,12 @@ class MatformerManager:
             cls._instance = cls.__new__(cls)
             cls._instance.initialize()
         return cls._instance
+
+    def get_factor_for_layer(self, layer_idx: int) -> int:
+        """Return the slicing factor for a specific layer."""
+        if self.mode == "uniform" or self.layer_factors is None:
+            return self.current_factor
+        return self.layer_factors.get(layer_idx, self.current_factor)
 
 
 class LayerNormBase(nn.Module):
@@ -103,6 +113,11 @@ class LayerNorm(LayerNormBase):
         self.weight = nn.Parameter(torch.ones(self.normalized_shape, device=config.init_device))
         self.bias = nn.Parameter(torch.zeros(self.normalized_shape, device=config.init_device))
         self.low_precision = low_precision
+
+    def reset_parameters(self) -> None:
+        torch.nn.init.ones_(self.weight)
+        if self.bias is not None:
+            torch.nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.low_precision:
@@ -368,11 +383,11 @@ class OlmoBlock(nn.Module):
         raise NotImplementedError
 
     @classmethod
-    def build(cls, config: ModelConfig) -> OlmoBlock:
+    def build(cls, config: ModelConfig, layer_idx: int = 0) -> OlmoBlock:
         if config.block_type == BlockType.sequential:
-            return OlmoSequentialBlock(config)
+            return OlmoSequentialBlock(config, layer_idx=layer_idx)
         elif config.block_type == BlockType.parallel:
-            return OlmoParallelBlock(config)
+            return OlmoParallelBlock(config, layer_idx=layer_idx)
         else:
             raise NotImplementedError(f"not sure how to handle block type '{config.block_type}'")
 
@@ -383,8 +398,9 @@ class OlmoSequentialBlock(OlmoBlock):
     (plus another skip connection).
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, layer_idx: int = 0):
         super().__init__(config)
+        self.layer_idx = layer_idx
         # Layer norms.
         self.attn_norm = LayerNorm.build(config)
         self.ff_norm = LayerNorm.build(config)
@@ -426,14 +442,17 @@ class OlmoSequentialBlock(OlmoBlock):
 
         # Add feed-forward projection.
         # shape: (batch_size, seq_len, d_model)
-        if self.matmng.current_factor == 1:
+        factor = self.matmng.get_factor_for_layer(self.layer_idx)
+        if factor == 1:
             x = x + self.dropout(self.ff_out(self.act(self.ff_proj(self.ff_norm(x)))))
         else:
             n = self.ff_proj.weight.shape[0]
-            k = int(n/self.matmng.current_factor)
+            k = int(n / factor)
             w_proj = self.ff_proj.weight[:k]
             b_proj = self.ff_proj.bias[:k]
-            w_out = self.ff_out.weight[:, :k]
+            # Account for activation output multiplier (e.g. SwiGLU halves the dim)
+            k_out = int(k * self.act.output_multiplier)
+            w_out = self.ff_out.weight[:, :k_out]
             b_out = self.ff_out.bias
 
             x = x + self.dropout(F.linear(self.act(F.linear(self.ff_norm(x), w_proj, b_proj)), w_out, b_out))
@@ -452,8 +471,9 @@ class OlmoParallelBlock(OlmoBlock):
     to fuse the output projections, but we found that didn't help.
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, layer_idx: int = 0):
         super().__init__(config)
+        self.layer_idx = layer_idx
         self.norm = LayerNorm.build(config)
         # Fused attention and feed-forward projection.
         # NOTE: we could also fuse the attention and feed-forward output projections
@@ -583,7 +603,7 @@ class Olmo(nn.Module):
                     config.embedding_size or config.vocab_size, config.d_model, device=config.init_device
                 ),
                 emb_drop=nn.Dropout(config.embedding_dropout),
-                blocks=nn.ModuleList([OlmoBlock.build(config) for _ in range(config.n_layers)]),
+                blocks=nn.ModuleList([OlmoBlock.build(config, layer_idx=i) for i in range(config.n_layers)]),
                 ln_f=LayerNorm.build(config),
             )
         )
@@ -1008,7 +1028,7 @@ class Olmo(nn.Module):
 
         # Load state dict directly to target device.
         state_dict_path = cached_path(os.path.join(checkpoint_dir, "model.pt"))
-        state_dict = torch.load(state_dict_path, map_location="cpu")
+        state_dict = torch.load(state_dict_path, map_location="cpu", weights_only=False)
         model.load_state_dict(model._make_state_dict_compatible(state_dict))
 
         return model.to(torch.device(device)).eval()

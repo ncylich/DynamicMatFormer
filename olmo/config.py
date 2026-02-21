@@ -48,6 +48,7 @@ __all__ = [
     "WandbConfig",
     "FSDPConfig",
     "CheckpointType",
+    "HMatConfig",
 ]
 
 
@@ -452,6 +453,25 @@ class CheckpointType(StrEnum):
 
 
 @dataclass
+class HMatConfig(BaseConfig):
+    """Configuration for Heterogeneous Matryoshka (H-Mat)."""
+
+    enabled: bool = False
+    method: str = "fisher"  # "fisher" | "gumbel"
+
+    # Method A (Fisher) settings
+    calibration_batches: int = 128
+    budget_ratio: float = 0.25
+
+    # Method B (Gumbel) settings
+    gumbel_tau_start: float = 2.0
+    gumbel_tau_end: float = 0.1
+    gumbel_tau_anneal_steps: int = 0  # 0 = use max_duration
+    budget_penalty_lambda: float = 0.01
+    budget_penalty_target: float = 0.5
+
+
+@dataclass
 class TrainConfig(BaseConfig):
     """
     OLMo training configuration.
@@ -548,6 +568,11 @@ class TrainConfig(BaseConfig):
     """
 
     matformer_factor: int = 1
+
+    hmat: HMatConfig = field(default_factory=HMatConfig)
+    """
+    Heterogeneous Matryoshka (H-Mat) configuration.
+    """
 
     save_num_checkpoints_to_keep: int = -1
     """
