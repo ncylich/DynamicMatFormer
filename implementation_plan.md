@@ -1,0 +1,797 @@
+# Implementation Plan: Heterogeneous Matryoshka Networks (H-Mat) in MatFormer-OLMo
+
+## Overview
+
+This plan transforms the existing MatFormer-OLMo codebase from **uniform** MLP slicing (same factor at every layer) to **heterogeneous** layer-wise width allocation. We implement both methods from the research proposal:
+
+- **Method A (F-Mat):** Post-training Fisher-based analysis to find optimal per-layer widths for a pre-trained uniform MatFormer model. This is primarily an **analytical and diagnostic** phase -- it validates the U-shape sensitivity hypothesis and motivates Method B, but is not expected to produce large performance gains because the model was trained under uniform slicing assumptions.
+- **Method B (Learnable H-Mat):** In-training Gumbel-Softmax gates that learn per-layer dimension importance from scratch. This is where we expect **real performance improvements** over uniform MatFormer, since the model can organize its representations around heterogeneous widths from the start of training.
+
+All changes build on the existing `MatformerManager` / `OlmoSequentialBlock` architecture. The goal is minimal, surgical modifications to the codebase.
+
+---
+
+## Current Architecture Summary
+
+| Component | File | Key Lines | Role |
+|-----------|------|-----------|------|
+| `MatformerManager` | `olmo/model.py:43-57` | Singleton tracking `current_factor` | Global state for uniform slicing |
+| `OlmoSequentialBlock.forward` | `olmo/model.py:429-439` | `k = n / factor` weight slicing | Applies uniform MLP truncation |
+| `Trainer.train_step` | `olmo/train.py:604-618` | Loops over `{1, 2, 4, 8}` factors | Multiple forward-backward per batch |
+| `Trainer.eval` | `olmo/train.py:757-791` | Same factor loop for eval | Per-granularity evaluation |
+| `TrainConfig.matformer_factor` | `olmo/config.py:550` | Single int config | Controls uniform factor |
+
+**Current MLP slicing logic** (uniform):
+```python
+# olmo/model.py:429-439
+n = self.ff_proj.weight.shape[0]        # full MLP hidden dim
+k = int(n / self.matmng.current_factor) # SAME k for ALL layers
+w_proj = self.ff_proj.weight[:k]
+```
+
+**What changes:** Instead of a single global `current_factor` producing the same `k` for every layer, we introduce per-layer width allocations `k_l` for each layer `l`.
+
+---
+
+## Phase 0: Preparatory Refactoring ✅ COMPLETED
+
+### 0.1 Extend `MatformerManager` to Support Per-Layer Widths
+
+**File:** `olmo/model.py:43-57`
+
+Replace the scalar `current_factor` with a richer state that supports both uniform and heterogeneous modes.
+
+```python
+class MatformerManager:
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self):
+        self.current_factor = 1            # Backward-compat: uniform factor
+        self.layer_factors = None          # Dict[int, int] or None: per-layer factors
+        self.mode = "uniform"              # "uniform" | "heterogeneous"
+        self.gumbel_masks = None           # For Method B: per-layer soft masks
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.initialize()
+        return cls._instance
+
+    def get_factor_for_layer(self, layer_idx: int) -> int:
+        """Return the slicing factor for a specific layer."""
+        if self.mode == "uniform" or self.layer_factors is None:
+            return self.current_factor
+        return self.layer_factors.get(layer_idx, self.current_factor)
+```
+
+### 0.2 Thread `layer_idx` Through `OlmoSequentialBlock`
+
+**File:** `olmo/model.py`
+
+Each block needs to know its layer index. Currently blocks are built in `Olmo.__init__` (line ~620) via a ModuleList. We add `layer_idx` as a constructor argument:
+
+```python
+# In OlmoSequentialBlock.__init__:
+def __init__(self, config: ModelConfig, layer_idx: int = 0):
+    super().__init__(config)
+    self.layer_idx = layer_idx
+    self.matmng = MatformerManager.get_instance()
+    # ... rest unchanged
+```
+
+Update `Olmo.__init__` where blocks are created:
+```python
+# In Olmo.__init__:
+blocks = nn.ModuleList([OlmoBlock.build(config, layer_idx=i) for i in range(config.n_layers)])
+```
+
+### 0.3 Update Forward Pass to Use Per-Layer Factor
+
+**File:** `olmo/model.py:429-439`
+
+```python
+# In OlmoSequentialBlock.forward:
+factor = self.matmng.get_factor_for_layer(self.layer_idx)
+if factor == 1:
+    x = x + self.dropout(self.ff_out(self.act(self.ff_proj(self.ff_norm(x)))))
+else:
+    n = self.ff_proj.weight.shape[0]
+    k = int(n / factor)
+    w_proj = self.ff_proj.weight[:k]
+    b_proj = self.ff_proj.bias[:k]
+    w_out = self.ff_out.weight[:, :k]
+    b_out = self.ff_out.bias
+    x = x + self.dropout(F.linear(self.act(F.linear(self.ff_norm(x), w_proj, b_proj)), w_out, b_out))
+```
+
+### 0.4 Extend Config
+
+**File:** `olmo/config.py`
+
+```python
+@dataclass
+class HMatConfig(BaseConfig):
+    """Configuration for Heterogeneous Matryoshka (H-Mat)."""
+    enabled: bool = False
+    method: str = "fisher"           # "fisher" | "gumbel"
+
+    # Method A (Fisher) settings
+    calibration_batches: int = 128   # Number of batches for Fisher estimation
+    budget_ratio: float = 0.25       # Target parameter budget as fraction of full model
+
+    # Method B (Gumbel) settings
+    gumbel_tau_start: float = 2.0    # Initial Gumbel temperature
+    gumbel_tau_end: float = 0.1      # Final Gumbel temperature (annealed)
+    gumbel_tau_anneal_steps: int = 0 # Steps to anneal (0 = use max_duration)
+    budget_penalty_lambda: float = 0.01  # L1 penalty coefficient on mask sum
+    budget_penalty_target: float = 0.5   # Target fraction of dimensions active
+
+@dataclass
+class TrainConfig(BaseConfig):
+    # ... existing fields ...
+    matformer_factor: int = 1
+    hmat: HMatConfig = field(default_factory=HMatConfig)
+```
+
+### Tests for Phase 0
+
+**File:** `tests/test_hmat_basic.py`
+
+1. **test_matformer_manager_uniform_backward_compat:** Verify that with `mode="uniform"`, `get_factor_for_layer(i)` returns `current_factor` for all `i`.
+2. **test_matformer_manager_heterogeneous:** Set `layer_factors = {0: 1, 1: 4, 2: 2}` and verify correct per-layer factor retrieval.
+3. **test_layer_idx_assignment:** Build a small `Olmo` model and verify each block has the correct `layer_idx`.
+4. **test_forward_with_layer_factors:** Run a forward pass with heterogeneous factors; verify output shape is correct and no errors.
+5. **test_backward_with_layer_factors:** Run forward+backward with heterogeneous factors; verify all parameters get gradients.
+6. **test_uniform_unchanged:** Ensure existing uniform MatFormer behavior is completely unchanged when `hmat.enabled = False`.
+
+---
+
+## Phase 1: Method A -- Post-Training Fisher Saliency (F-Mat) ✅ COMPLETED
+
+### Goals
+
+Phase 1 is an **analysis and motivation** phase, not a performance phase. Because F-Mat operates on a model that was *trained with uniform slicing*, its weights were optimized under the assumption that every layer gets the same width at each granularity. Applying a heterogeneous allocation at eval time introduces a train-inference mismatch, which fundamentally limits the gains.
+
+**What we expect from Phase 1:**
+- **Empirical validation of the U-shape hypothesis:** Fisher saliency scores should reveal that early and late layers are significantly more sensitive to width reduction than intermediate layers. This is the core scientific claim that justifies the entire H-Mat approach.
+- **Diagnostic tooling:** Saliency heatmaps and per-layer sensitivity curves that inform which layers need protection and which are compressible.
+- **Analytical baseline:** A concrete comparison point for Phase 2. If F-Mat (with its train-inference mismatch) can show *any* improvement over uniform slicing, it strongly motivates the Gumbel approach.
+- **Marginal or no perplexity improvement** over uniform slicing at the same budget. The model cannot adapt its weights to the new allocation, so gains are limited to "smarter selection over fixed representations."
+
+### Results (Tiny 17.7M model, 2700 steps on Pile, matformer_factor=8)
+
+**Fisher Saliency (100 calibration batches):**
+```
+Per-Layer Sensitivity (top-1/8 concentration):
+  Layer  0: 0.37  ← early: saliency spread across all dims (needs full width)
+  Layer  1: 0.35  ← early: saliency spread across all dims (needs full width)
+  Layer  2: 0.91  ← late: saliency concentrated in top dims (compressible)
+  Layer  3: 0.85  ← late: saliency concentrated in top dims (compressible)
+```
+- Not a clean U-shape (likely due to only 4 layers — no "middle" to compress).
+- Core finding confirmed: **layers are not equally sensitive to width reduction**.
+
+**F-Mat Budget Allocation (25% budget):**
+| Layer | Uniform 1/4 | F-Mat 25% |
+|-------|-------------|-----------|
+| 0 | factor=4 | factor=4 |
+| 1 | factor=4 | **factor=2** (2x wider) |
+| 2 | factor=4 | **factor=8** (2x narrower) |
+| 3 | factor=4 | **factor=8** (2x narrower) |
+
+**Perplexity Comparison (100 eval batches on Pile validation):**
+| Config | MLP Dims | Perplexity |
+|--------|----------|------------|
+| Full model (1/1) | 8192 | 381.1 |
+| Uniform 1/2 | 4096 | 410.5 |
+| F-Mat 50% budget | 4096 | 417.5 (+7.0 worse) |
+| Uniform 1/4 | 2048 | 445.7 |
+| F-Mat 25% budget | 2048 | 453.7 (+8.0 worse) |
+| Uniform 1/8 | 1024 | 489.1 |
+
+- F-Mat slightly worse than uniform at matching budgets — **confirms train-inference mismatch prediction**.
+- Motivates Phase 2 (Gumbel): the model must learn heterogeneous allocation from scratch to benefit.
+
+### 1.1 Fisher Score Computation
+
+**New file:** `olmo/hmat/fisher.py`
+
+This module computes per-dimension saliency scores across all layers of a pre-trained model.
+
+**Algorithm:**
+1. Load a pre-trained uniform MatFormer checkpoint.
+2. Run forward+backward on a calibration dataset (e.g., 128 batches from Pile validation).
+3. For each MLP layer `l`, for each hidden dimension `d`:
+   - Accumulate the squared gradient of the loss w.r.t. the `d`-th row of `ff_proj.weight` and the `d`-th column of `ff_out.weight`.
+   - `saliency[l][d] = (grad_ff_proj_row_d ** 2 + grad_ff_out_col_d ** 2).sum()`
+4. Normalize per-layer: `saliency_norm[l][d] = saliency[l][d] / sum(saliency[l])`
+5. Return the full `saliency_norm` matrix of shape `(n_layers, mlp_hidden_dim)`.
+
+```python
+def compute_fisher_saliency(
+    model: Olmo,
+    dataloader: DataLoader,
+    num_batches: int = 128,
+    device: torch.device = torch.device("cuda"),
+) -> Dict[int, torch.Tensor]:
+    """
+    Compute per-dimension Fisher saliency scores for each MLP layer.
+
+    Returns:
+        Dict mapping layer_idx -> Tensor of shape (mlp_hidden_dim,)
+        with globally normalized saliency scores.
+    """
+    model.eval()
+    n_layers = len(model.transformer.blocks)
+    mlp_dim = model.transformer.blocks[0].ff_proj.weight.shape[0]
+
+    # Accumulate squared gradients
+    saliency = {l: torch.zeros(mlp_dim, device=device) for l in range(n_layers)}
+
+    for batch_idx, batch in enumerate(dataloader):
+        if batch_idx >= num_batches:
+            break
+        batch = move_to_device(batch, device)
+        model.zero_grad()
+
+        # Forward pass
+        logits = model(batch["input_ids"], attention_mask=batch.get("attention_mask")).logits
+        loss = F.cross_entropy(logits[..., :-1, :].reshape(-1, logits.size(-1)),
+                               batch["input_ids"][..., 1:].reshape(-1))
+        loss.backward()
+
+        # Accumulate per-dimension saliency
+        for l, block in enumerate(model.transformer.blocks):
+            # ff_proj: (mlp_dim, d_model) -- each row is one hidden dimension
+            grad_proj = block.ff_proj.weight.grad  # (mlp_dim, d_model)
+            # ff_out: (d_model, mlp_dim) -- each column is one hidden dimension
+            grad_out = block.ff_out.weight.grad    # (d_model, mlp_dim)
+
+            saliency[l] += (grad_proj ** 2).sum(dim=1) + (grad_out ** 2).sum(dim=0)
+
+    # Normalize: divide each layer's scores by the trace (sum of all scores in that layer)
+    for l in range(n_layers):
+        trace = saliency[l].sum()
+        if trace > 0:
+            saliency[l] = saliency[l] / trace
+
+    return saliency
+```
+
+### 1.2 Budget Knapsack Solver
+
+**New file:** `olmo/hmat/knapsack.py`
+
+Given saliency scores and a target parameter budget, find the optimal per-layer widths.
+
+**Constraints:**
+- Layer widths must be powers-of-2 fractions of the full width (to maintain MatFormer nesting compatibility): `{n, n/2, n/4, n/8, ...}`
+- Total parameters across all layers must not exceed the budget.
+- Each layer's width is chosen from the set of allowed widths.
+
+```python
+def solve_budget_allocation(
+    saliency: Dict[int, torch.Tensor],
+    budget_ratio: float,
+    allowed_factors: List[int],  # e.g., [1, 2, 4, 8]
+) -> Dict[int, int]:
+    """
+    Solve the multi-choice knapsack problem for per-layer width allocation.
+
+    Args:
+        saliency: Per-layer saliency scores from compute_fisher_saliency.
+        budget_ratio: Target fraction of total parameters to use.
+        allowed_factors: List of allowed slicing factors (must be powers of 2).
+
+    Returns:
+        Dict mapping layer_idx -> chosen factor for that layer.
+    """
+    n_layers = len(saliency)
+    mlp_dim = len(next(iter(saliency.values())))
+
+    # Total budget in "MLP dimension units"
+    total_budget = int(budget_ratio * n_layers * mlp_dim)
+
+    # For each layer and each allowed factor, compute:
+    #   - cost: number of dimensions used = mlp_dim / factor
+    #   - value: sum of saliency scores for the retained dimensions
+    choices = {}
+    for l in range(n_layers):
+        layer_choices = []
+        for factor in allowed_factors:
+            k = mlp_dim // factor
+            value = saliency[l][:k].sum().item()  # Top-k dims (already ordered by index)
+            cost = k
+            layer_choices.append((factor, cost, value))
+        choices[l] = layer_choices
+
+    # Dynamic programming knapsack
+    # dp[l][b] = max saliency achievable using layers 0..l with budget b
+    dp = [[0.0] * (total_budget + 1) for _ in range(n_layers + 1)]
+    choice_trace = [[0] * (total_budget + 1) for _ in range(n_layers)]
+
+    for l in range(n_layers):
+        for b in range(total_budget + 1):
+            best_val = -1.0
+            best_factor = allowed_factors[0]
+            for factor, cost, value in choices[l]:
+                if cost <= b and dp[l][b - cost] + value > best_val:
+                    best_val = dp[l][b - cost] + value
+                    best_factor = factor
+            dp[l + 1][b] = best_val
+            choice_trace[l][b] = best_factor
+
+    # Traceback
+    result = {}
+    remaining = total_budget
+    for l in range(n_layers - 1, -1, -1):
+        factor = choice_trace[l][remaining]
+        result[l] = factor
+        remaining -= mlp_dim // factor
+
+    return result
+```
+
+### 1.3 F-Mat Analysis Script
+
+**New file:** `scripts/compute_fmat.py`
+
+End-to-end script that:
+1. Loads a pre-trained uniform MatFormer checkpoint.
+2. Computes Fisher saliency scores on calibration data.
+3. Solves the knapsack problem for multiple budget ratios.
+4. Outputs a JSON file mapping `{budget_ratio: {layer_idx: factor}}`.
+5. Prints a summary table and the U-shaped sensitivity visualization.
+
+```bash
+# Usage:
+python scripts/compute_fmat.py \
+    --checkpoint /path/to/uniform-matformer-checkpoint \
+    --calibration_data /path/to/pile-validation/*.npy \
+    --budget_ratios 0.125,0.25,0.5 \
+    --output fmat_allocations.json
+```
+
+### 1.4 Heterogeneous Evaluation Script
+
+**New file:** `scripts/eval_hmat.py`
+
+Loads a pre-trained model, applies the F-Mat allocations to `MatformerManager.layer_factors`, and runs standard evaluation (perplexity + downstream tasks) to compare:
+- Uniform 1/4 slice vs. Heterogeneous 1/4-budget slice
+- Uniform 1/8 slice vs. Heterogeneous 1/8-budget slice
+
+### Tests for Phase 1
+
+**File:** `tests/test_fmat.py`
+
+1. **test_fisher_saliency_shape:** Verify output has correct shape `(n_layers, mlp_dim)`.
+2. **test_fisher_saliency_normalized:** Verify each layer's scores sum to 1.0.
+3. **test_fisher_saliency_nonzero:** Verify scores are non-negative and at least some are nonzero.
+4. **test_knapsack_budget_respected:** Verify the total parameters of the allocation <= budget.
+5. **test_knapsack_trivial:** With budget_ratio=1.0, all layers should get factor=1.
+6. **test_knapsack_minimal:** With budget_ratio close to 0, all layers should get the maximum factor.
+7. **test_knapsack_heterogeneous:** With a known synthetic saliency distribution (high at ends, low in middle), verify that end layers get lower factors (more width) and middle layers get higher factors (less width) -- i.e., the U-shape hypothesis.
+8. **test_fmat_end_to_end:** Load the test fixture model, run Fisher computation with 1 calibration batch, solve knapsack, apply to manager, run forward pass -- verify no errors and output shape is correct.
+
+---
+
+## Phase 2: Method B -- In-Training Gumbel-Softmax Masking (Learnable H-Mat)
+
+### Goals
+
+Phase 2 is the **primary performance phase** of this research. Unlike F-Mat (which retrofits heterogeneous allocation onto a uniformly-trained model), the Gumbel approach trains the model from scratch with learnable per-layer gates. The model can organize its representations around non-uniform widths from the very beginning of training -- there is no train-inference mismatch.
+
+**What we expect from Phase 2:**
+- **Measurable perplexity improvement** over uniform MatFormer at the same parameter budget. The proposal hypothesizes recovering 30-40% of the perplexity gap between the uniform sub-model and the full model. Even a more conservative 10-20% recovery would be a meaningful result.
+- **Learned heterogeneous allocations that reflect the U-shape:** The Gumbel logits should converge to wider widths at early/late layers and narrower widths at intermediate layers, independently confirming the sensitivity pattern observed in Phase 1's Fisher analysis.
+- **A strictly superior Pareto frontier:** For any given parameter budget, the Gumbel-learned allocation should match or beat the uniform allocation on perplexity and downstream task accuracy.
+- **Downstream task improvements:** Better perplexity should translate to improved accuracy on zero-shot benchmarks (PIQA, HellaSwag, etc.), particularly for aggressive compression ratios (1/4, 1/8 budgets) where uniform slicing degrades the most.
+
+### 2.1 Gumbel Mask Module
+
+**New file:** `olmo/hmat/gumbel.py`
+
+A learnable module that produces differentiable per-dimension masks for each layer's MLP.
+
+```python
+class GumbelMaskLayer(nn.Module):
+    """
+    Learnable per-dimension importance gate for a single MLP layer.
+    Uses Gumbel-Softmax to produce differentiable binary masks.
+    """
+
+    def __init__(self, mlp_dim: int):
+        super().__init__()
+        # Learnable logits: one per MLP hidden dimension
+        self.logits = nn.Parameter(torch.zeros(mlp_dim))
+
+    def forward(self, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
+        """
+        Returns a soft mask of shape (mlp_dim,) with values in [0, 1].
+
+        Args:
+            tau: Gumbel-Softmax temperature (lower = more discrete).
+            hard: If True, use straight-through estimator for hard masks.
+        """
+        if self.training:
+            # Sample Gumbel noise
+            gumbel_noise = -torch.log(-torch.log(
+                torch.rand_like(self.logits).clamp(1e-8, 1.0)
+            ))
+            # Soft sigmoid with temperature
+            noisy_logits = (self.logits + gumbel_noise) / tau
+            mask = torch.sigmoid(noisy_logits)
+
+            if hard:
+                # Straight-through estimator
+                hard_mask = (mask > 0.5).float()
+                mask = hard_mask - mask.detach() + mask
+        else:
+            # Deterministic at eval time
+            mask = (self.logits > 0).float()
+
+        return mask
+
+
+class GumbelMaskManager(nn.Module):
+    """
+    Manages Gumbel masks for all layers in the model.
+    """
+
+    def __init__(self, n_layers: int, mlp_dim: int):
+        super().__init__()
+        self.masks = nn.ModuleList([GumbelMaskLayer(mlp_dim) for _ in range(n_layers)])
+        self.n_layers = n_layers
+        self.mlp_dim = mlp_dim
+
+    def forward(self, layer_idx: int, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
+        return self.masks[layer_idx](tau=tau, hard=hard)
+
+    def budget_penalty(self) -> torch.Tensor:
+        """
+        L1 penalty: sum of all mask activations across all layers.
+        Drives redundant dimensions toward 0.
+        """
+        total = sum(mask.logits.sigmoid().sum() for mask in self.masks)
+        return total / (self.n_layers * self.mlp_dim)
+
+    def get_layer_widths(self, allowed_factors: List[int] = None) -> Dict[int, int]:
+        """
+        At eval time, convert learned logits into discrete per-layer widths.
+        Count active dimensions (logits > 0) per layer and snap to nearest
+        allowed MatFormer factor.
+        """
+        widths = {}
+        for l, mask_layer in enumerate(self.masks):
+            active = (mask_layer.logits > 0).sum().item()
+            ratio = active / self.mlp_dim
+            # Snap to nearest allowed factor
+            if allowed_factors:
+                best_factor = min(allowed_factors,
+                                  key=lambda f: abs(1.0/f - ratio))
+            else:
+                best_factor = max(1, round(1.0 / ratio)) if ratio > 0 else self.mlp_dim
+            widths[l] = best_factor
+        return widths
+```
+
+### 2.2 Integrate Gumbel Masks into Forward Pass
+
+**File:** `olmo/model.py` -- `OlmoSequentialBlock.forward`
+
+When Gumbel mode is active, the forward pass multiplies MLP activations by the soft mask instead of hard slicing:
+
+```python
+# In OlmoSequentialBlock.forward:
+if self.matmng.mode == "gumbel" and self.matmng.gumbel_masks is not None:
+    # Method B: Soft masking
+    tau = self.matmng.gumbel_tau
+    mask = self.matmng.gumbel_masks(self.layer_idx, tau=tau, hard=not self.training)
+    h = self.ff_proj(self.ff_norm(x))
+    h = self.act(h)
+    h = h * mask.unsqueeze(0).unsqueeze(0)  # Broadcast: (1, 1, mlp_dim)
+    x = x + self.dropout(self.ff_out(h))
+elif factor == 1:
+    x = x + self.dropout(self.ff_out(self.act(self.ff_proj(self.ff_norm(x)))))
+else:
+    # Existing hard-slicing logic (uniform or heterogeneous)
+    ...
+```
+
+### 2.3 Integrate Gumbel Training into `Trainer`
+
+**File:** `olmo/train.py`
+
+Changes to the training loop:
+
+1. **Initialization:** Create `GumbelMaskManager` and register its parameters with the optimizer.
+2. **Temperature Annealing:** Compute current `tau` based on global step and anneal schedule.
+3. **Budget Penalty:** Add the L1 budget penalty to the loss at each training step.
+4. **Logging:** Log mask statistics (mean activation per layer, effective width, budget penalty).
+
+```python
+# In Trainer.__init__ or Trainer.fit:
+if self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
+    self.gumbel_manager = GumbelMaskManager(
+        n_layers=self.cfg.model.n_layers,
+        mlp_dim=self.cfg.model.mlp_ratio * self.cfg.model.d_model,
+    ).to(self.device)
+
+    # Register with optimizer
+    self.optim.add_param_group({
+        "params": self.gumbel_manager.parameters(),
+        "lr": self.cfg.optimizer.learning_rate,  # Same LR or separate
+        "weight_decay": 0.0,  # No weight decay on mask logits
+    })
+
+    # Attach to MatformerManager
+    matmng = MatformerManager.get_instance()
+    matmng.mode = "gumbel"
+    matmng.gumbel_masks = self.gumbel_manager
+
+# In train_batch, after computing ce_loss:
+if self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
+    budget_penalty = self.gumbel_manager.budget_penalty()
+    target = self.cfg.hmat.budget_penalty_target
+    # Penalize deviation from target budget
+    loss = ce_loss + self.cfg.hmat.budget_penalty_lambda * (budget_penalty - target).abs()
+```
+
+**Temperature annealing** (compute at each step):
+```python
+# In train_step, before calling train_batch:
+if self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
+    anneal_steps = self.cfg.hmat.gumbel_tau_anneal_steps or self.cfg.max_duration
+    progress = min(1.0, self.global_step / anneal_steps)
+    tau = self.cfg.hmat.gumbel_tau_start * (
+        self.cfg.hmat.gumbel_tau_end / self.cfg.hmat.gumbel_tau_start
+    ) ** progress
+    matmng = MatformerManager.get_instance()
+    matmng.gumbel_tau = tau
+```
+
+### 2.4 Checkpoint Gumbel State
+
+**File:** `olmo/train.py` -- checkpoint save/load
+
+Add `gumbel_manager.state_dict()` to the checkpoint so that mask logits are preserved across restarts.
+
+### Tests for Phase 2
+
+**File:** `tests/test_gumbel.py`
+
+1. **test_gumbel_mask_shape:** Verify mask output has shape `(mlp_dim,)`.
+2. **test_gumbel_mask_range:** Verify mask values are in `[0, 1]` during training.
+3. **test_gumbel_mask_hard_eval:** Verify mask is binary `{0, 1}` during eval.
+4. **test_gumbel_temperature_effect:** High tau -> uniform ~0.5 mask; low tau -> near-binary mask.
+5. **test_gumbel_budget_penalty:** Verify penalty is a scalar and changes with logits.
+6. **test_gumbel_forward_pass:** Run forward pass with Gumbel masking; verify output shape.
+7. **test_gumbel_backward_pass:** Run forward+backward; verify gradients flow to both model params AND mask logits.
+8. **test_gumbel_gradient_to_logits:** Specifically verify `gumbel_manager.masks[l].logits.grad` is not None after backward.
+9. **test_gumbel_get_layer_widths:** Set known logits (half positive, half negative) and verify `get_layer_widths()` returns expected factors.
+10. **test_gumbel_tau_annealing:** Verify temperature schedule computes correct tau at start, middle, and end of training.
+11. **test_gumbel_training_step:** Integration test: run a single training step with Gumbel mode enabled on the test fixture model; verify metrics contain budget penalty.
+
+---
+
+## Phase 3: Integration, Evaluation & Comparison
+
+### 3.1 Unified Evaluation Framework
+
+**New file:** `scripts/eval_comparison.py`
+
+A single evaluation script that runs all three configurations head-to-head for a given parameter budget:
+1. **Full model** (baseline)
+2. **Uniform MatFormer** at the target budget
+3. **F-Mat heterogeneous** at the target budget
+4. **Gumbel-learned heterogeneous** at the target budget (if trained)
+
+Outputs a comparison table with:
+- Perplexity (Pile validation, C4)
+- Per-layer width allocation map
+- Total parameter count verification
+- Downstream task accuracy (when evaluators are configured)
+
+### 3.2 Visualization Utilities
+
+**New file:** `olmo/hmat/viz.py`
+
+Utilities to visualize:
+- **Saliency heatmap:** Layer x Dimension Fisher saliency scores
+- **U-shape curve:** Per-layer total saliency (validates the hypothesis)
+- **Allocation comparison:** Side-by-side uniform vs. heterogeneous width allocation bars
+- **Gumbel mask evolution:** How learned logits change over training steps
+- **Pareto frontier:** Accuracy vs. parameter budget for uniform vs. H-Mat
+
+### 3.3 Training Configs
+
+**New file:** `configs/pile-tiny-hmat-gumbel.yaml`
+
+```yaml
+# Extends pile-tiny.yaml with Gumbel H-Mat
+matformer_factor: 8
+hmat:
+  enabled: true
+  method: gumbel
+  gumbel_tau_start: 2.0
+  gumbel_tau_end: 0.1
+  gumbel_tau_anneal_steps: 0    # Use max_duration
+  budget_penalty_lambda: 0.01
+  budget_penalty_target: 0.5
+```
+
+**New file:** `configs/pile-tiny-hmat-fisher.yaml`
+
+```yaml
+# Standard uniform MatFormer training, then post-hoc Fisher analysis
+matformer_factor: 8
+hmat:
+  enabled: false  # Fisher is post-training only
+```
+
+### Tests for Phase 3
+
+**File:** `tests/test_hmat_integration.py`
+
+1. **test_uniform_vs_heterogeneous_same_budget:** Given a tiny model, verify that uniform and heterogeneous allocations with the same budget produce the same total parameter count.
+2. **test_fmat_then_eval:** Train a tiny model for a few steps, compute F-Mat allocations, evaluate with heterogeneous factors -- verify the pipeline runs end-to-end.
+3. **test_gumbel_then_extract_widths:** Train a tiny model with Gumbel for a few steps, extract learned widths, verify they're valid MatFormer factors.
+4. **test_config_backward_compat:** Verify that loading an old config without `hmat` section works correctly (defaults to disabled).
+5. **test_checkpoint_gumbel_roundtrip:** Save and load a checkpoint with Gumbel mask state; verify logits are preserved.
+
+---
+
+## File Change Summary
+
+### Modified Files
+
+| File | Changes |
+|------|---------|
+| `olmo/model.py` | Extend `MatformerManager` with per-layer factors, `mode`, Gumbel mask support. Add `layer_idx` to `OlmoBlock.__init__`. Update `OlmoSequentialBlock.forward` for heterogeneous slicing + Gumbel masking. Update `OlmoParallelBlock` similarly. Update `Olmo.__init__` to pass `layer_idx`. |
+| `olmo/config.py` | Add `HMatConfig` dataclass. Add `hmat` field to `TrainConfig`. |
+| `olmo/train.py` | Initialize `GumbelMaskManager` when enabled. Add budget penalty to loss. Add tau annealing logic. Save/load Gumbel state in checkpoints. Log mask statistics. |
+| `configs/pile-tiny.yaml` | Add `hmat:` section (disabled by default). |
+
+### New Files
+
+| File | Purpose |
+|------|---------|
+| `olmo/hmat/__init__.py` | Package init |
+| `olmo/hmat/fisher.py` | Fisher saliency computation |
+| `olmo/hmat/knapsack.py` | Budget allocation solver |
+| `olmo/hmat/gumbel.py` | Gumbel-Softmax mask modules |
+| `olmo/hmat/viz.py` | Visualization utilities |
+| `scripts/compute_fmat.py` | Post-training Fisher analysis script |
+| `scripts/eval_hmat.py` | Heterogeneous evaluation script |
+| `scripts/eval_comparison.py` | Head-to-head comparison script |
+| `configs/pile-tiny-hmat-gumbel.yaml` | Training config for Gumbel H-Mat |
+| `configs/pile-tiny-hmat-fisher.yaml` | Training config for Fisher analysis |
+| `tests/test_hmat_basic.py` | Phase 0 tests |
+| `tests/test_fmat.py` | Phase 1 tests (Fisher + knapsack) |
+| `tests/test_gumbel.py` | Phase 2 tests (Gumbel masking) |
+| `tests/test_hmat_integration.py` | Phase 3 integration tests |
+
+---
+
+## Implementation Order & Dependencies
+
+```
+Phase 0 (Foundation)
+  ├── 0.1 Extend MatformerManager         ← No dependencies
+  ├── 0.2 Thread layer_idx                ← Depends on 0.1
+  ├── 0.3 Update forward pass             ← Depends on 0.1, 0.2
+  ├── 0.4 Extend config                   ← No dependencies
+  └── Tests                               ← Depends on 0.1-0.4
+
+Phase 1 (Fisher / F-Mat)                  ← Depends on Phase 0
+  ├── 1.1 Fisher score computation         ← No dependencies within phase
+  ├── 1.2 Knapsack solver                  ← No dependencies within phase
+  ├── 1.3 F-Mat script                     ← Depends on 1.1, 1.2
+  ├── 1.4 Eval script                      ← Depends on 1.3
+  └── Tests                                ← Depends on 1.1-1.4
+
+Phase 2 (Gumbel / Learnable H-Mat)        ← Depends on Phase 0
+  ├── 2.1 Gumbel mask module               ← No dependencies within phase
+  ├── 2.2 Integrate into forward pass      ← Depends on 2.1
+  ├── 2.3 Integrate into Trainer           ← Depends on 2.1, 2.2
+  ├── 2.4 Checkpoint support               ← Depends on 2.3
+  └── Tests                                ← Depends on 2.1-2.4
+
+Phase 3 (Integration)                     ← Depends on Phase 1 & 2
+  ├── 3.1 Comparison evaluation framework
+  ├── 3.2 Visualization utilities
+  ├── 3.3 Training configs
+  └── Tests
+```
+
+**Note:** Phases 1 and 2 are independent of each other and can be developed in parallel after Phase 0 is complete.
+
+---
+
+## Key Design Decisions
+
+1. **Backward compatibility:** When `hmat.enabled = False` (default), the entire system behaves identically to the current codebase. Zero risk of regressions.
+
+2. **Powers-of-2 factors only:** Per-layer factors are constrained to `{1, 2, 4, 8, ...}` to maintain MatFormer's nested submodel extraction property. A model trained with heterogeneous factors `{layer_0: 2, layer_1: 4, ...}` still extracts valid submodels.
+
+3. **Gumbel masks are a separate nn.Module:** They have their own parameters and optimizer group. This keeps the core model weights clean and allows easy ablation (remove masks, keep model).
+
+4. **Fisher computation uses existing model:** F-Mat operates on a fully trained uniform MatFormer checkpoint. No changes to training are needed -- it's a pure post-processing step.
+
+5. **Soft masking during training, hard slicing at inference:** Gumbel masks multiply activations by continuous [0,1] values during training (for gradient flow), but snap to hard 0/1 at eval time. The final extracted submodel uses the same weight-slicing mechanism as uniform MatFormer.
+
+6. **Temperature annealing follows exponential schedule:** `tau = tau_start * (tau_end / tau_start) ^ progress` provides smooth transition from exploration to exploitation.
+
+---
+
+## Phase 2 Results: Gumbel-Softmax Learnable Masking (COMPLETED)
+
+### Implementation Summary
+
+**New files created:**
+- `olmo/hmat/gumbel.py` — `GumbelMaskLayer` (per-layer learnable gate via Gumbel-Sigmoid) and `GumbelMaskManager` (manages masks for all layers, budget penalty, width extraction)
+- `tests/test_gumbel.py` — 28 tests covering mask shape/range, temperature effects, gradients, forward/backward integration, checkpointing, config
+- `configs/pile-tiny-hmat-gumbel.yaml` — Short training config (540 steps, pile data)
+- `configs/pile-tiny-hmat-gumbel-long.yaml` — Long training config (2700 steps, pile-700M data)
+- `scripts/eval_gumbel_comparison.py` — Eval script comparing gumbel vs baseline at all sub-model sizes
+- `scripts/run_hparam_search.sh` — Parallel hyperparameter search (6 trials, 1 GPU each)
+
+**Files modified:**
+- `olmo/model.py` — `OlmoSequentialBlock.forward()` combines gumbel masks with MatFormer factor slicing: at each sub-model width, the mask is sliced to `mask[:k_out]` preserving nested structure
+- `olmo/train.py` — `init_gumbel()` creates GumbelMaskManager + separate AdamW optimizer; budget penalty added to loss; tau annealing per step; gumbel state saved as `gumbel.pt` in checkpoints
+- `olmo/hmat/__init__.py` — Exports `GumbelMaskLayer`, `GumbelMaskManager`
+
+### Training Results (17M model, 4 layers, pile-700M)
+
+**540-step comparison (directly comparable, same data/steps/seed):**
+
+| Config | Eval PPL (full) |
+|--------|----------------|
+| Baseline MatFormer (uniform, factor=8) | **155.9** |
+| Gumbel H-Mat (best hparams: tau=0.5, lam=0.001) | 174.0 |
+| Gap | +18.1 (+11.6%) |
+
+**2700-step comparison:**
+
+| Config | Full (1/1) | 1/2 | 1/4 | 1/8 |
+|--------|-----------|-----|-----|-----|
+| Baseline (uniform MatFormer) | **381.1** | **410.5** | **445.7** | **489.1** |
+| Gumbel H-Mat (tau=2.0, lam=0.01) | 454.2 | 475.4 | 501.1 | 530.8 |
+
+**Learned mask allocations (2700 steps, tau=2.0, lam=0.01):**
+- Layer 0: 66.6% active (early — widest)
+- Layer 1: 56.9% active
+- Layer 2: 39.9% active
+- Layer 3: 36.6% active (late — narrowest)
+- Mean: 50.0% (exactly at target)
+
+The masks learned a **monotonically decreasing** allocation — early layers need more width, later layers are more compressible.
+
+### Hyperparameter Search (6 trials, 540 steps each)
+
+| Trial | tau_start | lambda | Eval PPL |
+|-------|-----------|--------|----------|
+| **T1** | **0.5** | **0.001** | **174.0** |
+| T4 | 2.0 | 0.001 | 174.6 |
+| T2 | 0.5 | 0.005 | 175.0 |
+| T3 | 0.5 | 0.01 | 175.6 |
+| T6 | 1.0 | 0.005 | 176.1 |
+| T5 | 1.0 | 0.001 | 176.4 |
+
+**Key finding:** `budget_penalty_lambda` matters more than `gumbel_tau_start`. Lower lambda (0.001) consistently outperforms higher values. Tau has minimal effect.
+
+### Analysis
+
+The gumbel mechanism successfully **learns heterogeneous per-layer allocation** from scratch during training, confirming that different layers have different width sensitivities. However, at this tiny model scale (17M params, 4 layers), the masking overhead hurts overall perplexity by ~12% compared to the simpler uniform baseline.
+
+**Why the gap exists at small scale:**
+1. Gumbel noise during training acts as regularization that a 4-layer model can't absorb
+2. Soft masking (multiplying by ~0.5) effectively halves capacity during early training
+3. With only 4 layers, there's limited room for heterogeneous allocation to help — the allocation differences are subtle (67% vs 37%)
+4. The budget penalty, even at lambda=0.001, adds a competing objective
+
+**Expected improvements at larger scale:** The gap should narrow or reverse because (a) more layers means more allocation flexibility, (b) the per-layer sensitivity U-shape is more pronounced, (c) the relative overhead of mask parameters becomes negligible, and (d) the model has more capacity to absorb the regularization effect.
