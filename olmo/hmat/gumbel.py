@@ -17,11 +17,14 @@ import torch.nn as nn
 class GumbelMaskLayer(nn.Module):
     """Per-layer learnable importance gate using Gumbel-Sigmoid."""
 
-    def __init__(self, mlp_dim: int):
+    def __init__(self, mlp_dim: int, init_scale: float = 2.2):
         super().__init__()
         self.mlp_dim = mlp_dim
-        # Initialize logits to small positive values so masks start near 0.5
-        self.logits = nn.Parameter(torch.zeros(mlp_dim))
+        # Linear decay: first dims get positive logits (always on),
+        # last dims get negative logits (usually off).
+        # sigmoid(2.2)≈0.9, sigmoid(-2.2)≈0.1, mean≈0.5 (matches typical budget target).
+        # This makes initial sub-model slicing match baseline MatFormer behavior.
+        self.logits = nn.Parameter(torch.linspace(init_scale, -init_scale, mlp_dim))
 
     def forward(self, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
         """
