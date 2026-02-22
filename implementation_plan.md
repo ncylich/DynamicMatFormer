@@ -1074,3 +1074,46 @@ class HMatConfig(BaseConfig):
 4. **Adaptive allocation:** Fisher EMA tracks changing importance over training — allocation isn't frozen at initialization.
 5. **Warmup eliminates early-training capacity loss:** The model trains at full capacity during warmup, building both good weights and stable saliency estimates before any masking.
 6. **Exploration prevents lock-in:** Gumbel noise ensures masked-out dimensions still occasionally activate, keeping Fisher scores calibrated and allowing allocation to shift if importance changes.
+
+---
+
+## Experimental Results: Phase 2.5 + Freeze Ablations (540 steps, pile-700M)
+
+### Freeze Experiment
+
+| Config | Full (1/1) | 1/2 | 1/4 | 1/8 | Notes |
+|--------|-----------|-----|-----|-----|-------|
+| **Baseline** | **155.9** | 161.8 | 167.2 | 172.9 | — |
+| **Phase 2 learned (best)** | 157.7 | **158.2** | **162.2** | **167.1** | scale=1.1, tau=0.5, lam=0.001 |
+| Freeze 10% (broken schedule) | 167.3 | 167.5 | 171.1 | 175.8 | Tau didn't finish annealing before freeze |
+| Freeze 10% (fixed schedule) | 163.3 | 163.5 | 167.7 | 172.7 | Tau completes annealing in first 90% |
+
+**Freeze conclusion:** The fixed schedule improved over the broken one (163.3 vs 167.3), but both are worse than no-freeze (157.7). At 540 steps, masks haven't differentiated enough from init for freeze to add value. Freeze may help at longer training (2700+ steps) where masks diverge significantly.
+
+### Fisher-Gumbel (Phase 2.5) Ablation Study
+
+All ablations use fisher_gumbel method with 15% warmup (81 steps) as the base config.
+
+| Ablation | Full (1/1) | 1/2 | 1/4 | 1/8 | What was tested |
+|----------|-----------|-----|-----|-----|----------------|
+| Fisher base (15% warmup) | 166.7 | 166.7 | 170.7 | 175.9 | Baseline fisher-gumbel |
+| **A: Smooth blend** (every step, blend=0.05) | **164.8** | **164.8** | **168.9** | **173.7** | Smooth per-step logit blending vs periodic hard replace |
+| B: 30% warmup | 165.0 | 165.0 | 169.0 | 173.6 | More warmup steps |
+| C: Log-scaled Fisher | 300.4 | 300.4 | 300.4 | 300.4 | Log-scale magnitude preservation vs rank-based |
+| D: Factor-1 only Fisher | 166.7 | 166.7 | 170.7 | 175.9 | Only accumulate from factor=1 passes |
+
+### Ablation Analysis
+
+1. **Smooth blend (A) helps modestly** — 164.8 vs 166.7 base. Confirms hypothesis #1: periodic hard logit replacement is disruptive; smooth per-step blending is better. But still 7 PPL behind learned gumbel.
+
+2. **More warmup (B) barely helps** — 165.0 vs 166.7. 30% warmup only marginally better than 15%. The issue isn't warmup duration.
+
+3. **Log-scaled mapping (C) catastrophically fails** — 300.4. The log-scale normalization concentrates most dimensions near the minimum logit value, effectively creating a near-uniform mask that destroys the ordering structure. The rank-based mapping is far superior.
+
+4. **Factor-1 only (D) identical to base** — 166.7 = 166.7. Factor bias in Fisher accumulation is NOT an issue. Gradients from sub-model iterations don't meaningfully distort the saliency estimates.
+
+### Root Cause Conclusion
+
+The fundamental limitation of Fisher-gumbel is **hypothesis #6: no gradient signal on masks**. In learned gumbel (Phase 2), the CE loss gradient flows directly through the mask values, telling each dimension exactly how much it should be on/off. Fisher-gumbel only has an indirect heuristic (squared gradients → rank → logits) with no closed-loop feedback. The 7+ PPL gap (157.7 vs 164.8 best) reflects this structural disadvantage.
+
+**Phase 2 with learned gumbel masks (scale=1.1, tau=0.5, lambda=0.001) remains the best approach**, outperforming baseline MatFormer at all compressed sub-model sizes while staying within 1.2% at full width.

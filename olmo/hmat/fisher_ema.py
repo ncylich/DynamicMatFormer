@@ -57,19 +57,30 @@ class FisherEMA:
             fisher = (grad_out ** 2).sum(dim=0)
             self.scores[l] = self.beta * self.scores[l] + (1 - self.beta) * fisher.detach()
 
-    def get_logits(self, scale: float = 1.1) -> List[torch.Tensor]:
+    def get_logits(self, scale: float = 1.1, mode: str = "rank") -> List[torch.Tensor]:
         """
-        Convert Fisher EMA scores to Gumbel logits via rank-based mapping.
+        Convert Fisher EMA scores to Gumbel logits.
 
-        Dimensions are ranked by saliency within each layer. Top-ranked dims
-        get positive logits (+scale), bottom-ranked get negative (-scale).
+        Args:
+            scale: Controls the logit range [-scale, +scale].
+            mode: "rank" = rank-based linear mapping (default),
+                  "log" = log-scaled Fisher scores normalized to [-scale, +scale].
         """
         logits = []
         for l in range(self.n_layers):
-            # Rank dimensions by saliency (highest = rank 0)
-            ranks = self.scores[l].argsort(descending=True).argsort()
-            # Map ranks to logits: rank 0 → +scale, rank mlp_dim-1 → -scale
-            layer_logits = scale - (2 * scale * ranks.float() / (self.mlp_dim - 1))
+            if mode == "log":
+                # Log-scale preserves magnitude differences between dims
+                log_scores = torch.log1p(self.scores[l])
+                if log_scores.max() > log_scores.min():
+                    # Normalize to [-scale, +scale]
+                    normalized = (log_scores - log_scores.min()) / (log_scores.max() - log_scores.min())
+                    layer_logits = scale * (2 * normalized - 1)
+                else:
+                    layer_logits = torch.zeros_like(log_scores)
+            else:
+                # Rank-based: top-saliency → +scale, bottom → -scale
+                ranks = self.scores[l].argsort(descending=True).argsort()
+                layer_logits = scale - (2 * scale * ranks.float() / (self.mlp_dim - 1))
             logits.append(layer_logits)
         return logits
 

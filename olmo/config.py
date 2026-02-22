@@ -475,7 +475,10 @@ class HMatConfig(BaseConfig):
     # Phase 2.5 (Fisher-Guided Gumbel) settings
     fisher_ema_beta: float = 0.99
     fisher_warmup_frac: float = 0.05  # Fraction of training for warmup (no masks)
-    fisher_update_interval: int = 50  # Update logits from Fisher EMA every K steps
+    fisher_update_interval: int = 50  # Update logits from Fisher EMA every K steps (0 = every step)
+    fisher_logit_mode: str = "rank"  # "rank" or "log" — how to convert Fisher scores to logits
+    fisher_logit_blend: float = 0.0  # 0 = hard replace, >0 = EMA blend (e.g., 0.01 = smooth per-step)
+    fisher_factor1_only: bool = False  # Only accumulate Fisher from factor=1 passes
 
 
 @dataclass

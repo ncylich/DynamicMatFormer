@@ -633,7 +633,10 @@ class Trainer:
                 if self.gumbel_optim is not None:
                     self.gumbel_optim = None  # Stop updating mask logits
             else:
+                # Compress tau schedule to complete BEFORE freeze point
                 anneal_steps = self.cfg.hmat.gumbel_tau_anneal_steps or self.cfg.max_duration
+                if freeze_frac > 0:
+                    anneal_steps = int(anneal_steps * (1 - freeze_frac))
                 progress = min(1.0, self.global_step / anneal_steps)
                 tau_start = self.cfg.hmat.gumbel_tau_start
                 tau_end = self.cfg.hmat.gumbel_tau_end
@@ -656,6 +659,11 @@ class Trainer:
                 ce_batch_loss = self.ce_train_loss_metric.compute()
                 losses.append((ce_batch_loss, z_batch_loss))
 
+                # #3 ablation: accumulate Fisher only from factor=1 pass
+                if (i == 0 and self.fisher_ema is not None and
+                        self.cfg.hmat.fisher_factor1_only):
+                    unwrapped = self.fsdp_model.module if hasattr(self.fsdp_model, 'module') else self.fsdp_model
+                    self.fisher_ema.update(unwrapped)
 
                 self.matmng.current_factor *= 2
         else:
@@ -669,7 +677,11 @@ class Trainer:
         if self.fisher_ema is not None and self.cfg.hmat.method == "fisher_gumbel":
             # Access the unwrapped model for gradient access
             unwrapped = self.fsdp_model.module if hasattr(self.fsdp_model, 'module') else self.fsdp_model
-            self.fisher_ema.update(unwrapped)
+
+            # #3 ablation: only accumulate Fisher from factor=1 passes
+            if not self.cfg.hmat.fisher_factor1_only:
+                self.fisher_ema.update(unwrapped)
+            # If factor1_only, accumulation happens in the factor loop (see below)
 
             warmup_steps = int(self.cfg.hmat.fisher_warmup_frac * self.cfg.max_duration)
 
@@ -679,12 +691,24 @@ class Trainer:
                 matmng.mode = "gumbel"
                 log.info(f"Fisher-Gumbel warmup complete at step {self.global_step}, enabling masks")
 
-            # Periodically update logits from Fisher EMA
+            # Update logits from Fisher EMA
+            update_interval = self.cfg.hmat.fisher_update_interval or 1  # 0 means every step
             if (self.global_step >= warmup_steps and
-                    self.global_step % self.cfg.hmat.fisher_update_interval == 0):
-                new_logits = self.fisher_ema.get_logits(scale=self.cfg.hmat.gumbel_init_scale)
+                    self.global_step % update_interval == 0):
+                new_logits = self.fisher_ema.get_logits(
+                    scale=self.cfg.hmat.gumbel_init_scale,
+                    mode=self.cfg.hmat.fisher_logit_mode,
+                )
+                blend = self.cfg.hmat.fisher_logit_blend
                 for i, mask_layer in enumerate(self.gumbel_manager.masks):
-                    mask_layer.set_logits(new_logits[i])
+                    if blend > 0:
+                        # Option A: smooth EMA blend instead of hard replace
+                        with torch.no_grad():
+                            mask_layer.logits.copy_(
+                                (1 - blend) * mask_layer.logits + blend * new_logits[i]
+                            )
+                    else:
+                        mask_layer.set_logits(new_logits[i])
 
         # Clip gradient norms.
         grad_norm: Optional[float] = None
@@ -721,12 +745,13 @@ class Trainer:
             metrics["optim/grad_norm"] = grad_norm
 
         # Log Gumbel metrics.
-        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
+        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method in ("gumbel", "fisher_gumbel"):
             metrics.update(self.gumbel_manager.log_summary())
             matmng = MatformerManager.get_instance()
             metrics["gumbel/tau"] = matmng.gumbel_tau
-            budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
-            metrics["gumbel/budget_penalty"] = budget_penalty.item()
+            if self.cfg.hmat.method == "gumbel":
+                budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
+                metrics["gumbel/budget_penalty"] = budget_penalty.item()
 
         # Update min train loss and see if we should stop early.
         self.min_train_loss = min(self.min_train_loss, ce_batch_loss.item())  # type: ignore
