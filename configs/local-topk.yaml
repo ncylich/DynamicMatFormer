@@ -88,6 +88,7 @@ hmat:
   gumbel_tau_start: 0.5
   gumbel_tau_end: 0.1
   gumbel_init_scale: 1.1
+  vanilla_warmup_frac: 0.15  # Train vanilla model for first 15% of steps
 
 eval_interval: 5000
 eval_subset_num_batches: 5

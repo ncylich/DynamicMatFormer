@@ -86,6 +86,7 @@ hmat:
   gumbel_tau_start: 0.5         # Same best tau from Phase 2
   gumbel_tau_end: 0.1
   gumbel_init_scale: 1.1        # Same best scale from Phase 2
+  vanilla_warmup_frac: 0.15     # Train vanilla model for first 15% of steps
   # No budget_penalty_lambda or budget_penalty_target needed
 
 eval_interval: 100

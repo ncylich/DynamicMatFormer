@@ -596,8 +596,8 @@ class Trainer:
                 else:
                     loss = ce_loss
 
-                # Add Gumbel budget penalty.
-                if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel":
+                # Add Gumbel budget penalty (skip during vanilla warmup).
+                if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel" and not getattr(self, '_in_vanilla_warmup', False):
                     budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
                     loss = loss + self.cfg.hmat.budget_penalty_lambda * budget_penalty / len(micro_batches)
 
@@ -618,6 +618,18 @@ class Trainer:
             indices = "\t".join(str(int(i)) for i in batch["index"])
             self.indices_file.write(f"{self.global_step}\t{indices}\n")
 
+        # === Vanilla warmup: train with full (uniform) model before enabling masks ===
+        vanilla_warmup_steps = int(self.cfg.hmat.vanilla_warmup_frac * self.cfg.max_duration) if self.cfg.hmat.enabled else 0
+        self._in_vanilla_warmup = vanilla_warmup_steps > 0 and self.global_step <= vanilla_warmup_steps
+
+        # Activate mask mode when warmup ends
+        if not self._in_vanilla_warmup and vanilla_warmup_steps > 0 and self.cfg.hmat.enabled:
+            matmng = MatformerManager.get_instance()
+            if matmng.mode == "uniform":
+                target = "gumbel" if self.cfg.hmat.method == "fisher_gumbel" else self.cfg.hmat.method
+                matmng.mode = target
+                log.info(f"Vanilla warmup complete at step {self.global_step}, enabling {target} masks")
+
         # Zero-gradients.
         self.optim.zero_grad(set_to_none=True)
         if self.gumbel_optim is not None:
@@ -633,8 +645,8 @@ class Trainer:
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)
 
-        # Update Gumbel temperature if in gumbel mode.
-        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method in ("gumbel", "gumbel_topk", "fisher_gumbel"):
+        # Update Gumbel temperature if in gumbel mode (skip during vanilla warmup).
+        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method in ("gumbel", "gumbel_topk", "fisher_gumbel") and not self._in_vanilla_warmup:
             matmng = MatformerManager.get_instance()
 
             # Check if we should freeze masks (last X% of training)
@@ -651,17 +663,23 @@ class Trainer:
                 anneal_steps = self.cfg.hmat.gumbel_tau_anneal_steps or self.cfg.max_duration
                 if freeze_frac > 0:
                     anneal_steps = int(anneal_steps * (1 - freeze_frac))
-                progress = min(1.0, self.global_step / anneal_steps)
+                # Adjust for vanilla warmup: tau annealing starts after warmup
+                effective_step = self.global_step - vanilla_warmup_steps
+                effective_anneal = max(1, anneal_steps - vanilla_warmup_steps)
+                progress = min(1.0, effective_step / effective_anneal)
                 tau_start = self.cfg.hmat.gumbel_tau_start
                 tau_end = self.cfg.hmat.gumbel_tau_end
                 tau = tau_start * (tau_end / tau_start) ** progress
                 matmng.gumbel_tau = tau
 
-        # Update temperature if in topk mode (reuses gumbel_tau infrastructure).
-        if self.topk_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "topk":
+        # Update temperature if in topk mode (reuses gumbel_tau infrastructure, skip during warmup).
+        if self.topk_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "topk" and not self._in_vanilla_warmup:
             matmng = MatformerManager.get_instance()
             anneal_steps = self.cfg.hmat.gumbel_tau_anneal_steps or self.cfg.max_duration
-            progress = min(1.0, self.global_step / anneal_steps)
+            # Adjust for vanilla warmup: tau annealing starts after warmup
+            effective_step = self.global_step - vanilla_warmup_steps
+            effective_anneal = max(1, anneal_steps - vanilla_warmup_steps)
+            progress = min(1.0, effective_step / effective_anneal)
             tau_start = self.cfg.hmat.gumbel_tau_start
             tau_end = self.cfg.hmat.gumbel_tau_end
             tau = tau_start * (tau_end / tau_start) ** progress
@@ -683,9 +701,9 @@ class Trainer:
                 ce_batch_loss = self.ce_train_loss_metric.compute()
                 losses.append((ce_batch_loss, z_batch_loss))
 
-                # #3 ablation: accumulate Fisher only from factor=1 pass
+                # #3 ablation: accumulate Fisher only from factor=1 pass (skip during warmup)
                 if (i == 0 and self.fisher_ema is not None and
-                        self.cfg.hmat.fisher_factor1_only):
+                        self.cfg.hmat.fisher_factor1_only and not self._in_vanilla_warmup):
                     unwrapped = self.fsdp_model.module if hasattr(self.fsdp_model, 'module') else self.fsdp_model
                     self.fisher_ema.update(unwrapped)
 
@@ -697,8 +715,8 @@ class Trainer:
             ce_batch_loss = self.ce_train_loss_metric.compute()
             losses.append((ce_batch_loss, z_batch_loss))
 
-        # Fisher EMA update (Phase 2.5): accumulate from existing gradients before optimizer step
-        if self.fisher_ema is not None and self.cfg.hmat.method == "fisher_gumbel":
+        # Fisher EMA update (Phase 2.5): accumulate from existing gradients before optimizer step (skip during warmup)
+        if self.fisher_ema is not None and self.cfg.hmat.method == "fisher_gumbel" and not self._in_vanilla_warmup:
             # Access the unwrapped model for gradient access
             unwrapped = self.fsdp_model.module if hasattr(self.fsdp_model, 'module') else self.fsdp_model
 
@@ -742,9 +760,9 @@ class Trainer:
         # Optimizer step.
         self.optim.step()
         self.scheduler.step()
-        if self.gumbel_optim is not None:
+        if self.gumbel_optim is not None and not self._in_vanilla_warmup:
             self.gumbel_optim.step()
-        if self.topk_optim is not None:
+        if self.topk_optim is not None and not self._in_vanilla_warmup:
             self.topk_optim.step()
 
         if len(losses) > 1:
@@ -1000,7 +1018,15 @@ class Trainer:
             )
         else:
             # Phase 2 / 2.FIX.2: Learned gumbel or gumbel-top-k
-            matmng.mode = self.cfg.hmat.method  # "gumbel" or "gumbel_topk"
+            if self.cfg.hmat.vanilla_warmup_frac > 0:
+                matmng.mode = "uniform"
+                log.info(
+                    f"Vanilla warmup: masks disabled for first "
+                    f"{self.cfg.hmat.vanilla_warmup_frac*100:.0f}% of training "
+                    f"({int(self.cfg.hmat.vanilla_warmup_frac * self.cfg.max_duration)} steps)"
+                )
+            else:
+                matmng.mode = self.cfg.hmat.method  # "gumbel" or "gumbel_topk"
             self.gumbel_optim = torch.optim.AdamW(
                 self.gumbel_manager.parameters(),
                 lr=self.cfg.optimizer.learning_rate,
@@ -1043,7 +1069,15 @@ class Trainer:
         )
 
         matmng = MatformerManager.get_instance()
-        matmng.mode = "topk"
+        if self.cfg.hmat.vanilla_warmup_frac > 0:
+            matmng.mode = "uniform"
+            log.info(
+                f"Vanilla warmup: masks disabled for first "
+                f"{self.cfg.hmat.vanilla_warmup_frac*100:.0f}% of training "
+                f"({int(self.cfg.hmat.vanilla_warmup_frac * self.cfg.max_duration)} steps)"
+            )
+        else:
+            matmng.mode = "topk"
         matmng.topk_masks = self.topk_manager
         matmng.gumbel_tau = self.cfg.hmat.gumbel_tau_start
 

@@ -88,6 +88,7 @@ hmat:
   gumbel_tau_anneal_steps: 0  # 0 = use max_duration
   budget_penalty_lambda: 0.01
   budget_penalty_target: 0.5
+  vanilla_warmup_frac: 0.15  # Train vanilla model for first 15% of steps
 
 eval_interval: 100
 eval_subset_num_batches: 10
