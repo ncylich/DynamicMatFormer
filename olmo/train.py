@@ -634,7 +634,7 @@ class Trainer:
         batch = move_to_device(batch, self.device)
 
         # Update Gumbel temperature if in gumbel mode.
-        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method in ("gumbel", "fisher_gumbel"):
+        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method in ("gumbel", "gumbel_topk", "fisher_gumbel"):
             matmng = MatformerManager.get_instance()
 
             # Check if we should freeze masks (last X% of training)
@@ -771,13 +771,14 @@ class Trainer:
             metrics["optim/grad_norm"] = grad_norm
 
         # Log Gumbel metrics.
-        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method in ("gumbel", "fisher_gumbel"):
+        if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method in ("gumbel", "gumbel_topk", "fisher_gumbel"):
             metrics.update(self.gumbel_manager.log_summary())
             matmng = MatformerManager.get_instance()
             metrics["gumbel/tau"] = matmng.gumbel_tau
             if self.cfg.hmat.method == "gumbel":
                 budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
                 metrics["gumbel/budget_penalty"] = budget_penalty.item()
+            # gumbel_topk: no budget penalty — sparsity is structural via top-k
 
         # Log TopK metrics.
         if self.topk_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "topk":
@@ -963,7 +964,7 @@ class Trainer:
 
     def init_gumbel(self):
         """Initialize Gumbel mask manager if configured."""
-        if not self.cfg.hmat.enabled or self.cfg.hmat.method not in ("gumbel", "fisher_gumbel"):
+        if not self.cfg.hmat.enabled or self.cfg.hmat.method not in ("gumbel", "gumbel_topk", "fisher_gumbel"):
             return
 
         from .model import Activation
@@ -998,19 +999,25 @@ class Trainer:
                 f"update_interval={self.cfg.hmat.fisher_update_interval}"
             )
         else:
-            # Phase 2: Learned gumbel
-            matmng.mode = "gumbel"
+            # Phase 2 / 2.FIX.2: Learned gumbel or gumbel-top-k
+            matmng.mode = self.cfg.hmat.method  # "gumbel" or "gumbel_topk"
             self.gumbel_optim = torch.optim.AdamW(
                 self.gumbel_manager.parameters(),
                 lr=self.cfg.optimizer.learning_rate,
                 weight_decay=0.0,
                 betas=tuple(self.cfg.optimizer.betas),
             )
-            log.info(
-                f"Initialized GumbelMaskManager: {self.cfg.model.n_layers} layers, "
-                f"mlp_dim={mlp_dim}, target={self.cfg.hmat.budget_penalty_target}, "
-                f"lambda={self.cfg.hmat.budget_penalty_lambda}"
-            )
+            if self.cfg.hmat.method == "gumbel_topk":
+                log.info(
+                    f"Initialized Gumbel-Top-K: {self.cfg.model.n_layers} layers, "
+                    f"mlp_dim={mlp_dim} (no budget penalty — sparsity is structural)"
+                )
+            else:
+                log.info(
+                    f"Initialized GumbelMaskManager: {self.cfg.model.n_layers} layers, "
+                    f"mlp_dim={mlp_dim}, target={self.cfg.hmat.budget_penalty_target}, "
+                    f"lambda={self.cfg.hmat.budget_penalty_lambda}"
+                )
 
     def init_topk(self):
         """Initialize TopK mask manager if configured."""

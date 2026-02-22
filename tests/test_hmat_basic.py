@@ -177,16 +177,16 @@ class TestUniformUnchanged:
     def test_hmat_config_defaults(self):
         """Verify HMatConfig defaults are sane."""
         cfg = HMatConfig()
-        assert cfg.enabled is False
-        assert cfg.method == "fisher"
+        assert cfg.enabled is True
+        assert cfg.method == "gumbel"
         assert cfg.calibration_batches == 128
         assert cfg.budget_ratio == 0.25
         assert cfg.gumbel_tau_start == 2.0
         assert cfg.gumbel_tau_end == 0.1
 
     def test_train_config_has_hmat_field(self):
-        """TrainConfig should have an hmat field defaulting to disabled."""
+        """TrainConfig should have an hmat field with HMatConfig."""
         cfg = TrainConfig()
         assert hasattr(cfg, "hmat")
         assert isinstance(cfg.hmat, HMatConfig)
-        assert cfg.hmat.enabled is False
+        assert cfg.hmat.enabled is True

@@ -61,6 +61,45 @@ class TestGumbelMaskLayerShape:
             assert v.item() in (0.0, 1.0), f"Hard mask contains non-binary value {v}"
 
 
+class TestGumbelMaskLayerKAware:
+    def test_k_full_width_returns_ones(self):
+        """When k >= mlp_dim, mask should be all-ones (no overhead at full model)."""
+        mask_layer = GumbelMaskLayer(256)
+        mask_layer.logits.data = torch.randn(256)  # Arbitrary logits
+        mask = mask_layer(tau=1.0, k=256)
+        torch.testing.assert_close(mask, torch.ones(256))
+
+    def test_k_larger_than_dim_returns_ones(self):
+        """k > mlp_dim should also return all-ones."""
+        mask_layer = GumbelMaskLayer(128)
+        mask = mask_layer(tau=1.0, k=512)
+        torch.testing.assert_close(mask, torch.ones(128))
+
+    def test_k_less_than_dim_returns_learned_mask(self):
+        """When k < mlp_dim, mask should be a learned sigmoid, not all-ones."""
+        mask_layer = GumbelMaskLayer(256, init_scale=1.1)
+        mask_layer.eval()
+        mask = mask_layer(tau=1.0, k=128)
+        # Should NOT be all-ones; some values should be < 1
+        assert not torch.allclose(mask, torch.ones(256), atol=0.01)
+
+    def test_k_none_returns_learned_mask(self):
+        """k=None (default) should return a learned mask, not all-ones."""
+        mask_layer = GumbelMaskLayer(256, init_scale=1.1)
+        mask_layer.eval()
+        mask = mask_layer(tau=1.0)
+        assert not torch.allclose(mask, torch.ones(256), atol=0.01)
+
+    def test_k_full_width_detached_from_logits(self):
+        """All-ones mask at k >= mlp_dim should be detached from logits (no grad_fn)."""
+        mask_layer = GumbelMaskLayer(128)
+        mask_layer.train()
+        mask = mask_layer(tau=1.0, k=128)
+        # The returned tensor should not track gradients through logits
+        assert not mask.requires_grad, "All-ones mask should not require grad"
+        assert mask.grad_fn is None, "All-ones mask should have no grad_fn"
+
+
 class TestGumbelMaskLayerTemperature:
     def test_high_tau_produces_soft_masks(self):
         """High temperature should produce masks near 0.5."""
@@ -249,16 +288,17 @@ class TestGumbelForwardPass:
         expected_vocab = small_model_config.embedding_size or small_model_config.vocab_size
         assert output.logits.shape == (2, 16, expected_vocab)
 
-    def test_forward_gumbel_vs_uniform_full_mask(self, small_model_config):
-        """Gumbel with all-ones mask should produce same output as uniform factor=1."""
+    def test_factor1_gumbel_matches_uniform(self, small_model_config):
+        """At factor=1, gumbel mode should produce identical output to uniform (no mask applied)."""
         model = Olmo(small_model_config).eval()
         mlp_dim = _post_act_mlp_dim(small_model_config)
         gumbel_mgr = GumbelMaskManager(
             n_layers=small_model_config.n_layers, mlp_dim=mlp_dim
         )
-        # Set all logits to large positive → mask ≈ 1.0
+        # Use arbitrary (non-trivial) logits — at factor=1, mask is skipped entirely
         for mask_layer in gumbel_mgr.masks:
-            mask_layer.logits.data = torch.ones(mlp_dim) * 100.0
+            mask_layer.logits.data = torch.randn(mlp_dim)
+        gumbel_mgr.eval()
 
         input_ids = torch.randint(0, small_model_config.vocab_size, (1, 16))
 
@@ -269,20 +309,20 @@ class TestGumbelForwardPass:
         with torch.no_grad():
             out_uniform = model(input_ids)
 
-        # Gumbel mode with all-ones hard mask
+        # Gumbel mode at factor=1 — mask should NOT be applied
         matmng.mode = "gumbel"
         matmng.gumbel_masks = gumbel_mgr
-        matmng.gumbel_tau = 0.01  # Very low tau + eval → hard mask ≈ 1.0
-        gumbel_mgr.eval()
+        matmng.gumbel_tau = 1.0
+        matmng.current_factor = 1
         with torch.no_grad():
             out_gumbel = model(input_ids)
 
-        torch.testing.assert_close(out_uniform.logits, out_gumbel.logits, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(out_uniform.logits, out_gumbel.logits, atol=1e-5, rtol=1e-5)
 
 
 class TestGumbelBackward:
-    def test_backward_with_gumbel(self, small_model_config):
-        """Backward pass with gumbel mode should produce gradients on model and mask params."""
+    def test_backward_with_gumbel_factor_gt_1(self, small_model_config):
+        """Backward pass at factor>1 should produce gradients on mask params."""
         model = Olmo(small_model_config).train()
         mlp_dim = _post_act_mlp_dim(small_model_config)
         gumbel_mgr = GumbelMaskManager(
@@ -294,6 +334,7 @@ class TestGumbelBackward:
         matmng.mode = "gumbel"
         matmng.gumbel_masks = gumbel_mgr
         matmng.gumbel_tau = 1.0
+        matmng.current_factor = 2  # Must be >1 for gumbel mask to be applied
 
         input_ids = torch.randint(0, small_model_config.vocab_size, (2, 16))
         output = model(input_ids)
@@ -311,10 +352,41 @@ class TestGumbelBackward:
             if param.requires_grad:
                 assert param.grad is not None, f"Model param {name} has no gradient"
 
-        # Gumbel mask logits should have gradients
+        # Gumbel mask logits should have gradients (within the sliced prefix)
         for i, mask_layer in enumerate(gumbel_mgr.masks):
             assert mask_layer.logits.grad is not None, f"Mask layer {i} logits have no gradient"
             assert mask_layer.logits.grad.abs().sum() > 0, f"Mask layer {i} has zero gradients"
+
+    def test_no_mask_gradient_at_factor_1(self, small_model_config):
+        """At factor=1, gumbel mask is not applied so mask params get no CE gradient."""
+        model = Olmo(small_model_config).train()
+        mlp_dim = _post_act_mlp_dim(small_model_config)
+        gumbel_mgr = GumbelMaskManager(
+            n_layers=small_model_config.n_layers, mlp_dim=mlp_dim
+        )
+        gumbel_mgr.train()
+
+        matmng = MatformerManager.get_instance()
+        matmng.mode = "gumbel"
+        matmng.gumbel_masks = gumbel_mgr
+        matmng.gumbel_tau = 1.0
+        matmng.current_factor = 1
+
+        input_ids = torch.randint(0, small_model_config.vocab_size, (2, 16))
+        output = model(input_ids)
+        logits = output.logits
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous()
+        loss = CrossEntropyLoss()(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
+        loss.backward()
+
+        # Mask logits should have NO gradient from CE loss at factor=1
+        for i, mask_layer in enumerate(gumbel_mgr.masks):
+            assert mask_layer.logits.grad is None or mask_layer.logits.grad.abs().sum() == 0, \
+                f"Mask layer {i} should not receive gradient at factor=1"
 
     def test_backward_with_budget_penalty(self, small_model_config):
         """Budget penalty should produce gradients that push masks toward target."""
@@ -329,6 +401,7 @@ class TestGumbelBackward:
         matmng.mode = "gumbel"
         matmng.gumbel_masks = gumbel_mgr
         matmng.gumbel_tau = 1.0
+        matmng.current_factor = 2  # factor>1 for mask to be applied
 
         input_ids = torch.randint(0, small_model_config.vocab_size, (2, 16))
         output = model(input_ids)
@@ -347,6 +420,133 @@ class TestGumbelBackward:
         # Mask logits should have gradients from both CE loss and budget penalty
         for i, mask_layer in enumerate(gumbel_mgr.masks):
             assert mask_layer.logits.grad is not None
+
+
+# ============================================================
+# Phase 2.FIX.2: Gumbel-Top-K Hybrid Tests
+# ============================================================
+
+
+class TestGumbelTopKFactorDependent:
+    def test_different_k_different_active_counts(self):
+        """At different k values, the mask should produce different active counts."""
+        mask_layer = GumbelMaskLayer(256, init_scale=1.1)
+        mask_layer.eval()  # Deterministic (no Gumbel noise)
+
+        counts = {}
+        for k in [32, 64, 128, 256]:
+            mask = mask_layer(tau=0.1, hard=True, k=k)
+            counts[k] = int(mask.sum().item())
+
+        # At k=256 (full width): all-ones
+        assert counts[256] == 256
+        # Different k should give different active counts
+        assert counts[32] < counts[64] < counts[128] < counts[256]
+        # Active count should be close to k (within the prefix, may not be exact)
+        assert abs(counts[32] - 32) <= 10
+        assert abs(counts[64] - 64) <= 10
+
+
+class TestGumbelTopKNoiseVaries:
+    def test_noise_produces_different_boundaries(self):
+        """Gumbel noise should shift which neurons are near the threshold."""
+        torch.manual_seed(42)
+        mask_layer = GumbelMaskLayer(256, init_scale=1.1)
+        mask_layer.train()
+
+        masks = []
+        for _ in range(10):
+            mask = mask_layer(tau=0.5, k=128)
+            masks.append(mask.detach().clone())
+
+        # Not all masks should be identical (Gumbel noise varies the boundary)
+        diffs = sum((masks[i] - masks[0]).abs().sum().item() for i in range(1, 10))
+        assert diffs > 0, "Gumbel noise should produce different masks across samples"
+
+
+class TestGumbelTopKDeterministicEval:
+    def test_eval_matches_topk(self):
+        """At eval (no noise), Gumbel-Top-K should produce identical masks to deterministic Top-K."""
+        from olmo.hmat.topk import TopKMaskLayer
+
+        logits = torch.randn(256)
+        k = 64
+
+        gumbel_layer = GumbelMaskLayer(256)
+        gumbel_layer.logits.data = logits.clone()
+        gumbel_layer.eval()
+
+        topk_layer = TopKMaskLayer(256)
+        topk_layer.logits.data = logits.clone()
+        topk_layer.eval()
+
+        gumbel_mask = gumbel_layer(tau=0.5, hard=True, k=k)
+        topk_mask = topk_layer(k=k, tau=0.5, hard=True)
+
+        torch.testing.assert_close(gumbel_mask, topk_mask)
+
+
+class TestGumbelTopKNoBudgetPenalty:
+    def test_gumbel_topk_config(self):
+        """Gumbel-Top-K should be a valid method with no budget penalty needed."""
+        cfg = HMatConfig(method="gumbel_topk")
+        assert cfg.method == "gumbel_topk"
+
+
+class TestGumbelTopKGradient:
+    def test_gradient_to_all_logits(self):
+        """Gradient should flow to logits at all positions, not just top-k."""
+        mask_layer = GumbelMaskLayer(128, init_scale=1.1)
+        mask_layer.train()
+
+        mask = mask_layer(tau=0.5, k=32)
+        loss = mask.sum()
+        loss.backward()
+
+        assert mask_layer.logits.grad is not None
+        # Gradient should be non-zero at positions both above and below the threshold
+        grad = mask_layer.logits.grad
+        # Top-32 positions get gradient from sigmoid(noisy - threshold)
+        # Below-threshold positions also get gradient (sigmoid is non-zero everywhere)
+        assert grad.abs().sum() > 0
+        # At least some gradient should be present in the bottom half of logits
+        bottom_half_grad = grad[64:].abs().sum()
+        assert bottom_half_grad > 0, "Gradient should reach below-threshold logits"
+
+    def test_gumbel_topk_forward_backward_integration(self, small_model_config):
+        """Full integration: model + gumbel_topk mode, forward+backward at factor>1."""
+        model = Olmo(small_model_config).train()
+        mlp_dim = _post_act_mlp_dim(small_model_config)
+        gumbel_mgr = GumbelMaskManager(
+            n_layers=small_model_config.n_layers, mlp_dim=mlp_dim
+        )
+        gumbel_mgr.train()
+
+        matmng = MatformerManager.get_instance()
+        matmng.mode = "gumbel_topk"
+        matmng.gumbel_masks = gumbel_mgr
+        matmng.gumbel_tau = 0.5
+        matmng.current_factor = 4
+
+        input_ids = torch.randint(0, small_model_config.vocab_size, (2, 16))
+        output = model(input_ids)
+
+        shift_logits = output.logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous()
+        loss = CrossEntropyLoss()(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
+        loss.backward()
+
+        # Model params should have gradients
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"Model param {name} has no gradient"
+
+        # Gumbel mask logits should have gradients
+        for i, mask_layer in enumerate(gumbel_mgr.masks):
+            assert mask_layer.logits.grad is not None, f"Mask layer {i} has no gradient"
+            assert mask_layer.logits.grad.abs().sum() > 0
 
 
 # ============================================================
@@ -425,7 +625,7 @@ class TestHMatConfigGumbel:
         assert cfg.gumbel_tau_start == 2.0
         assert cfg.gumbel_tau_end == 0.1
         assert cfg.gumbel_tau_anneal_steps == 0
-        assert cfg.budget_penalty_lambda == 0.01
+        assert cfg.budget_penalty_lambda == 0.001
         assert cfg.budget_penalty_target == 0.5
 
     def test_gumbel_config_custom(self):

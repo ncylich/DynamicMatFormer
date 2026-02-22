@@ -49,7 +49,7 @@ class MatformerManager:
     def initialize(self):
         self.current_factor = 1            # Backward-compat: uniform factor
         self.layer_factors = None          # Dict[int, int] or None: per-layer factors
-        self.mode = "uniform"              # "uniform" | "heterogeneous" | "gumbel" | "topk"
+        self.mode = "uniform"              # "uniform" | "heterogeneous" | "gumbel" | "gumbel_topk" | "topk"
         self.gumbel_masks = None           # For Method B: per-layer soft masks
         self.gumbel_tau = 1.0              # Current Gumbel temperature
         self.topk_masks = None             # For Phase 2.2: per-layer top-k masks
@@ -445,19 +445,12 @@ class OlmoSequentialBlock(OlmoBlock):
         # shape: (batch_size, seq_len, d_model)
         factor = self.matmng.get_factor_for_layer(self.layer_idx)
         use_gumbel = self.matmng.mode == "gumbel" and self.matmng.gumbel_masks is not None
+        use_gumbel_topk = self.matmng.mode == "gumbel_topk" and self.matmng.gumbel_masks is not None
         use_topk = self.matmng.mode == "topk" and self.matmng.topk_masks is not None
-
-        if use_gumbel:
-            tau = self.matmng.gumbel_tau
-            mask = self.matmng.gumbel_masks.get_mask(
-                self.layer_idx, tau=tau, hard=not self.training
-            )
 
         if factor == 1:
             h = self.act(self.ff_proj(self.ff_norm(x)))
-            if use_gumbel:
-                h = h * mask.unsqueeze(0).unsqueeze(0)
-            # topk at factor=1: k >= mlp_dim → all-ones mask, no overhead
+            # At factor=1 (full model): no mask applied — preserves full capacity.
             x = x + self.dropout(self.ff_out(h))
         else:
             n = self.ff_proj.weight.shape[0]
@@ -471,7 +464,18 @@ class OlmoSequentialBlock(OlmoBlock):
 
             h = self.act(F.linear(self.ff_norm(x), w_proj, b_proj))
             if use_gumbel:
-                # Slice mask to match the sub-model width (preserves nesting)
+                tau = self.matmng.gumbel_tau
+                # Vanilla Gumbel-Sigmoid: k=None → per-element sigmoid
+                mask = self.matmng.gumbel_masks.get_mask(
+                    self.layer_idx, tau=tau, hard=not self.training
+                )
+                h = h * mask[:k_out].unsqueeze(0).unsqueeze(0)
+            if use_gumbel_topk:
+                tau = self.matmng.gumbel_tau
+                # Gumbel-Top-K: k=k_out → top-k threshold on noisy logits
+                mask = self.matmng.gumbel_masks.get_mask(
+                    self.layer_idx, k=k_out, tau=tau, hard=not self.training
+                )
                 h = h * mask[:k_out].unsqueeze(0).unsqueeze(0)
             if use_topk:
                 tau = self.matmng.gumbel_tau  # Reuse tau infrastructure

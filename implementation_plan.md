@@ -835,6 +835,240 @@ The gap **narrows monotonically** at higher compression (9% → 4.4% → 3.4% �
 
 ---
 
+## Phase 2.0 FIX: Decouple Mask from Prefix Slicing
+
+### Problem
+
+Both Phase 2 (Gumbel) and Phase 2.2 (Top-K) share a fundamental structural flaw: the mask is learned over all `mlp_dim` dimensions globally, but at factor > 1 only `mask[:k_out]` is applied because the weights are prefix-sliced.
+
+**Current forward pass at factor=2 (k_out = mlp_dim/2):**
+```python
+# Weights are prefix-sliced — h has shape (B, T, k_out)
+h = self.act(F.linear(self.ff_norm(x), w_proj[:k], b_proj[:k]))
+# Mask is global but only prefix is used
+h = h * mask[:k_out]
+```
+
+This creates a semantic mismatch: the mask may rank neurons outside the prefix as important, but the sub-model can never access them. If training pushes high-importance logits to positions beyond k_out, the sliced mask `mask[:k_out]` has fewer active entries than intended — potentially far fewer.
+
+**This is why the decreasing `linspace(+scale, -scale)` initialization was mandatory.** It wasn't just a good init — it was a necessary constraint to keep high-importance logits aligned with prefix positions. Zero init and random init both failed precisely because they broke this implicit alignment:
+
+- **Zero init:** `sigmoid(0) = 0.5` everywhere — no preference for prefix positions, every neuron runs at half capacity
+- **Random init:** High logits scattered across all positions — `mask[:k_out]` captures only a random subset of the "important" neurons
+- **linspace init:** High logits at low positions by construction — `mask[:k_out]` always gets the highest-ranked neurons
+
+The linspace init is a band-aid. Gradient dynamics mostly preserve the ordering (neurons outside the prefix get no gradient from sub-model passes), but the constraint is implicit and fragile.
+
+### Fix: Full-Width Compute + Mask Zeroing
+
+Instead of prefix-slicing weights and then masking the prefix, compute the full MLP hidden state and let the mask do all the work. Zeroed-out dimensions contribute nothing through `ff_out`, so the output is mathematically correct.
+
+**Fixed forward pass at factor > 1:**
+```python
+# In OlmoSequentialBlock.forward, when use_gumbel or use_topk:
+
+if factor == 1:
+    h = self.act(self.ff_proj(self.ff_norm(x)))
+    # No mask at full width (gumbel: mask applied but ~1.0; topk: all-ones)
+    if use_gumbel:
+        h = h * mask.unsqueeze(0).unsqueeze(0)
+    x = x + self.dropout(self.ff_out(h))
+else:
+    # FULL-WIDTH compute — no weight slicing
+    h = self.act(self.ff_proj(self.ff_norm(x)))  # shape: (B, T, mlp_dim)
+
+    if use_gumbel:
+        h = h * mask.unsqueeze(0).unsqueeze(0)   # mask zeros out unimportant dims
+    if use_topk:
+        tau = self.matmng.gumbel_tau
+        topk_mask = self.matmng.topk_masks.get_mask(
+            self.layer_idx, k=k_out, tau=tau, hard=not self.training
+        )
+        h = h * topk_mask.unsqueeze(0).unsqueeze(0)  # full mask, no [:k_out] slice
+
+    x = x + self.dropout(self.ff_out(h))  # full-width ff_out; zeroed dims = zero contribution
+```
+
+**What changes:**
+1. Sub-model passes no longer slice `ff_proj` / `ff_out` weights when masks are active — the mask replaces prefix slicing as the sparsity mechanism
+2. The mask operates on the full `mlp_dim` vector — any neuron at any position can be selected
+3. Nesting is preserved automatically: for top-k, top-128 ⊆ top-256 ⊆ top-512; for gumbel, higher-logit neurons are always included at wider sub-models
+4. The `factor` variable still determines the target count k (how many neurons the sub-model should have), but not which positions they must occupy
+
+**Backward-compatible behavior:** When `mode == "uniform"` (no masks), the existing prefix-slicing code path is unchanged. The fix only affects the `use_gumbel` and `use_topk` branches.
+
+### Post-Training Neuron Reordering
+
+At inference, MatFormer sub-models are extracted via prefix slicing (`weight[:k]`). For this to work with position-independent masks, neurons must be reordered after training so that the most important neurons come first.
+
+**Reordering procedure (run once after training, before deployment):**
+
+```python
+def reorder_neurons_by_importance(model: Olmo, mask_manager) -> Olmo:
+    """
+    Reorder MLP neurons in each layer so that prefix slicing at inference
+    recovers the mask-learned allocation. Modifies weights in-place.
+
+    For each layer:
+    1. Rank neurons by mask importance (logit value)
+    2. Permute ff_proj rows and ff_out columns to match this ranking
+    3. After reordering, weight[:k] contains the top-k neurons by importance
+    """
+    for layer_idx, block in enumerate(model.transformer.blocks):
+        # Get importance ordering from mask logits
+        logits = mask_manager.masks[layer_idx].logits.detach()
+
+        # Permutation: sort by descending importance
+        perm = logits.argsort(descending=True)
+
+        # ff_proj: (mlp_dim, d_model) — permute rows
+        block.ff_proj.weight.data = block.ff_proj.weight.data[perm]
+        block.ff_proj.bias.data = block.ff_proj.bias.data[perm]
+
+        # Account for activation output_multiplier (e.g. SwiGLU)
+        # SwiGLU: ff_proj has 2*mlp_dim_out rows, ff_out has mlp_dim_out columns
+        # The mask applies post-activation, so we need the output-side permutation
+        act = Activation.build(model.config)
+        if act.output_multiplier != 1.0:
+            # For SwiGLU: ff_proj has shape (2*mlp_dim_out, d_model)
+            # First half = gate, second half = value — permute both halves
+            mlp_dim_out = int(block.ff_proj.weight.shape[0] * act.output_multiplier)
+            gate_perm = perm  # permutation for the gate half
+            val_perm = perm + mlp_dim_out  # same permutation offset for value half
+            full_perm = torch.cat([gate_perm, val_perm])
+            block.ff_proj.weight.data = block.ff_proj.weight.data[full_perm]
+            block.ff_proj.bias.data = block.ff_proj.bias.data[full_perm]
+
+        # ff_out: (d_model, mlp_dim_out) — permute columns
+        block.ff_out.weight.data = block.ff_out.weight.data[:, perm]
+
+    return model
+```
+
+After reordering, the model can be deployed as a standard MatFormer: `weight[:k]` gives the top-k neurons at each layer, and the mask is no longer needed at inference.
+
+### Reorder Script
+
+**New file:** `scripts/reorder_neurons.py`
+
+Loads a trained checkpoint + mask state, applies `reorder_neurons_by_importance`, saves a new checkpoint. The new checkpoint is a standard MatFormer model — no mask overhead at inference.
+
+```bash
+python scripts/reorder_neurons.py \
+    --checkpoint /path/to/trained-checkpoint \
+    --mask_state /path/to/gumbel.pt   # or topk.pt \
+    --output /path/to/reordered-checkpoint
+```
+
+### Training Compute Tradeoff
+
+Sub-model passes now compute the full MLP width instead of the prefix:
+
+| | Factor=1 | Factor=2 | Factor=4 | Factor=8 |
+|--|---------|----------|----------|----------|
+| **Before (prefix slicing)** | Full | 1/2 FLOPs | 1/4 FLOPs | 1/8 FLOPs |
+| **After (full + mask)** | Full | Full | Full | Full |
+
+Every sub-model pass costs the same as a full-model pass. For the 17M model this is negligible. For larger models, sub-model passes were already a small fraction of training time (the factor=1 pass dominates), and the benefit of correct mask semantics outweighs the cost.
+
+### Impact on Initialization
+
+With the fix, the decreasing linspace init is no longer structurally necessary — any init works because the mask can select neurons at any position. However, linspace may still be useful as a soft prior that speeds convergence (starts near the baseline MatFormer behavior). Zero init and random init become viable alternatives worth re-evaluating.
+
+### Changes Required
+
+| File | Change |
+|------|--------|
+| `olmo/model.py` | `OlmoSequentialBlock.forward`: when `use_gumbel` or `use_topk`, compute full-width MLP and apply full mask instead of prefix-slicing + `mask[:k_out]` |
+| `olmo/hmat/topk.py` | `TopKMaskLayer.forward`: remove the `[:k_out]` slice (caller no longer needs it) — mask is always full-width |
+| `scripts/reorder_neurons.py` | New script: post-training neuron reordering for inference-time prefix slicing |
+| `tests/test_gumbel.py` | Update integration tests to verify full-width mask application |
+| `tests/test_topk.py` | Update integration tests; add test for arbitrary-position neuron selection |
+| `tests/test_reorder.py` | New: verify neuron reordering produces equivalent outputs, verify prefix slicing after reorder matches mask-selected output |
+
+### Tests
+
+1. **test_full_width_mask_equivalence:** With linspace init (where mask ordering matches prefix ordering), verify that full-width-mask output equals prefix-sliced output. This confirms backward compatibility at init.
+2. **test_arbitrary_position_selection:** Set logits so that the top-k neurons are at non-prefix positions (e.g., positions 200-256 in a 512-dim layer). Verify the mask correctly activates those positions and the output is nonzero.
+3. **test_zero_init_viable:** With zero-init logits and full-width masking, verify the model trains without collapse (loss decreases over a few steps). This was previously catastrophic with prefix slicing.
+4. **test_reorder_preserves_output:** Run forward pass with mask, reorder neurons, run forward pass with prefix slicing (no mask). Verify outputs match.
+5. **test_reorder_prefix_nesting:** After reordering, verify that `weight[:k]` at factor=2 is a strict prefix of `weight[:2k]` at factor=1 — the MatFormer nesting property holds.
+6. **test_gumbel_full_width_gradient:** Verify gradients flow to all logits (not just prefix positions) through full-width mask application.
+7. **test_topk_full_width_gradient:** Same for top-k masks — verify boundary neurons at any position receive gradient.
+
+---
+
+## Phase 2.FIX.2: Gumbel Factor Independence
+
+### Problem
+
+The Phase 2.0 FIX removes prefix slicing when masks are active. For **Top-K** this is clean: at each factor, k is derived from the factor and top-k selects exactly k neurons at arbitrary positions.
+
+For **Gumbel-Sigmoid**, there is a problem: the gumbel mask `sigmoid(logits / tau)` produces the same values regardless of the current factor. With prefix slicing, different factors naturally saw different mask regions (`mask[:k_out]` at factor=2, `mask[:k_out/2]` at factor=4). With full-width compute, factors 2, 4, and 8 all apply the identical mask to the identical full-width hidden state — the factor loop produces identical outputs for all sub-model passes.
+
+**This means vanilla Gumbel-Sigmoid is not compatible with full-width compute in the multi-factor training loop.** The sub-model losses at factor=2, 4, 8 would be identical, wasting 3/4 of the training compute.
+
+### Solution: Gumbel-Top-K Hybrid
+
+Combine Gumbel noise (stochastic exploration) with Top-K thresholding (factor-dependent width):
+
+```python
+# In GumbelMaskLayer.forward, when k is not None and k < mlp_dim:
+def forward(self, tau=1.0, hard=False, k=None):
+    if k is not None and k >= self.mlp_dim:
+        return torch.ones_like(self.logits)
+
+    if self.training and not hard:
+        u = torch.rand_like(self.logits).clamp(1e-6, 1.0 - 1e-6)
+        gumbel_noise = -torch.log(-torch.log(u))
+        noisy_logits = self.logits + gumbel_noise
+    else:
+        noisy_logits = self.logits
+
+    if k is not None and k < self.mlp_dim:
+        # Top-K threshold on noisy logits — factor-dependent width
+        topk_vals, _ = noisy_logits.topk(k, sorted=False)
+        threshold = topk_vals.min()
+        y_soft = torch.sigmoid((noisy_logits - threshold) / tau)
+    else:
+        # Original gumbel-sigmoid (no factor truncation)
+        y_soft = torch.sigmoid(noisy_logits / tau)
+
+    if hard:
+        y_hard = (y_soft > 0.5).float()
+        return y_hard - y_soft.detach() + y_soft
+    return y_soft
+```
+
+Gumbel-Top-K is the natural synthesis: it uses the structural top-k constraint to guarantee factor-dependent widths (eliminating the budget penalty), while Gumbel noise makes the threshold stochastic — different neurons are near the boundary each step, providing broader gradient coverage than deterministic top-k.
+
+### Method Comparison
+
+| Method | Threshold | Noise | Factor-dependent | Budget penalty |
+|--------|-----------|-------|------------------|----------------|
+| **Top-K** (Phase 2.2) | k-th largest logit | None | Yes (k from factor) | No |
+| **Gumbel-Top-K** (new) | k-th largest noisy logit | Gumbel | Yes (k from factor) | No |
+| **Gumbel-Sigmoid** (Phase 2) | None (per-element sigmoid) | Gumbel | Only at factor=1 (all-ones) | Required |
+
+### Changes Required
+
+| File | Change |
+|------|--------|
+| `olmo/hmat/gumbel.py` | `GumbelMaskLayer.forward`: when `k is not None and k < mlp_dim`, apply top-k threshold on noisy logits instead of plain sigmoid |
+| `olmo/config.py` | Add `method: "gumbel_topk"` option to `HMatConfig` |
+| `olmo/train.py` | Handle `"gumbel_topk"` method: same init as gumbel but no budget penalty, pass k to mask |
+| `olmo/model.py` | When `use_gumbel` and factor > 1, pass `k=k_out` to `get_mask()` |
+
+### Tests
+
+1. **test_gumbel_topk_factor_dependent:** Verify that at different k values, the mask produces different active counts (unlike vanilla gumbel which is factor-independent).
+2. **test_gumbel_topk_noise_varies_boundary:** Run forward twice with same logits — Gumbel noise should produce different boundary selections (different neurons near threshold).
+3. **test_gumbel_topk_deterministic_eval:** At eval time (no noise), Gumbel-Top-K should produce identical masks to deterministic Top-K for the same logits and k.
+4. **test_gumbel_topk_no_budget_penalty:** Verify no budget penalty is computed — sparsity is structural via top-k.
+5. **test_gumbel_topk_gradient_to_all_logits:** Verify gradient flows to logits at all positions (not just top-k), since Gumbel noise can shift the boundary.
+
+---
+
 ## Phase 2.1: Fisher-Guided Gumbel Masking (Saliency-Driven Allocation)
 
 ### Motivation
@@ -1451,3 +1685,152 @@ Constraint: sum(k_l for all layers l) = total_budget
 ```
 
 This could be implemented as a higher-level Gumbel-Softmax over a small discrete set of per-layer budgets (e.g., each layer chooses from {k/4, k/2, k, 2k}), with the constraint enforced via a Lagrangian. This recovers the heterogeneous allocation from Phase 2 but with structural sparsity at each layer. This is left as a follow-up if Phase 2.2 baseline results are promising.
+
+---
+
+## Phase 2.3: Experimental Validation of Full-Width Fix
+
+### Experimental Setup
+
+All experiments use the same infrastructure as prior phases:
+
+- **Model:** 17M params, 4 layers, d_model=256, mlp_ratio=8, GELU, mlp_dim=2048
+- **Data:** Pile-700M (train) / Pile (val)
+- **Training:** matformer_factor=8, batch_size=128, sequence_length=2048
+- **Short runs:** 540 steps (for screening). **Long runs:** 2700 steps (for winners)
+- **Hardware:** 8x A100-40GB
+- **Seed:** 6198 (same as all prior experiments for comparability)
+- **Eval:** PPL at all sub-model widths {1/1, 1/2, 1/4, 1/8} using eval_gumbel_comparison.py
+
+**Metrics collected per run:**
+- Eval PPL at factors {1, 2, 4, 8} — the primary metric
+- Per-layer active fraction at each factor
+- Neuron reordering divergence: Kendall's tau between final logit ranking and initial logit ranking, per layer
+- Training loss curves (CE only, no budget penalty for top-k/gumbel-top-k)
+
+### Group 1: Fix Validation (3 runs, 540 steps)
+
+Verify the full-width fix works by comparing to pre-fix baselines with identical configs.
+
+| Run | Method | Init | Config | Baseline comparison |
+|-----|--------|------|--------|---------------------|
+| **V1** | Baseline | — | Uniform MatFormer, no masks | Control (expect ~155.9) |
+| **V2** | Top-K + fix | linspace(1.1) | tau=0.5 | Compare to pre-fix top-k |
+| **V3** | Gumbel-Top-K + fix | linspace(1.1) | tau=0.5 | Compare to pre-fix gumbel (157.7) |
+
+**What this answers:** Does the fix help, hurt, or have no effect when using the same linspace init that was previously required?
+
+**Expected:** At linspace init, the logit ordering already matches prefix ordering (97-99% overlap in Phase 2 results). So the fix should produce similar or slightly better results — the mask is doing the same thing but without the prefix-alignment fragility.
+
+### Group 2: Unbiased Initialization (8 runs, 540 steps)
+
+The central experiment. With prefix-alignment removed, test initialization strategies that were previously impossible.
+
+**Gumbel-Top-K runs:**
+
+| Run | Init | Rationale |
+|-----|------|-----------|
+| **G1** | `zeros` (all logits = 0) | Previously catastrophic (sigmoid(0)=0.5). Now: all logits tied → Gumbel noise alone breaks symmetry. Top-k threshold is random each step. Tests pure exploration. |
+| **G2** | `N(0, 0.3)` | Small random perturbation. Breaks symmetry immediately but with no positional bias. Gumbel noise adds further exploration. |
+| **G3** | `constant(+1.5)` | All logits equally positive (sigmoid ≈ 0.82). All neurons start "mostly on." The model starts at near-full capacity and learns what to prune. |
+| **G4** | `linspace(1.1, -1.1)` | Control. Same as V3. Included for direct comparison within the group. |
+
+**Top-K runs:**
+
+| Run | Init | Rationale |
+|-----|------|-----------|
+| **T1** | `zeros` (all logits = 0) | All ties → threshold at 0 for any k → sigmoid(0/tau) = 0.5 for all. First gradient step breaks symmetry. Tests whether top-k can bootstrap from scratch. |
+| **T2** | `N(0, 0.3)` | Random ranking from step 0. Top-k selects k random positions each step initially, gradient signal quickly reinforces useful neurons. |
+| **T3** | `constant(+1.5)` | All tied like zeros but at a higher value. Same dynamics for top-k (threshold = 1.5, sigmoid(0/tau)=0.5). Gradient breaks symmetry. |
+| **T4** | `linspace(1.1, -1.1)` | Control. Same as V2. |
+
+**What this answers:**
+- Can the methods learn from an unbiased starting point? (zeros, random)
+- Is the linspace bias actually helpful or just a crutch for the broken prefix-slicing design?
+- Does Gumbel noise help with symmetry breaking at zero/tied inits? (Compare G1 vs T1)
+
+**Key predictions:**
+- `zeros` should work for Gumbel-Top-K (noise breaks symmetry) but may struggle for Top-K (first gradient step must break all ties simultaneously)
+- `N(0, 0.3)` should work for both — random ranking is a good starting point when positions don't matter
+- `constant(+1.5)` is interesting: it starts at high capacity (like linspace) but without positional bias. The model must learn which neurons to turn off rather than which to turn on. May converge differently from linspace
+- `linspace` controls should match Group 1 results
+
+### Group 3: Gumbel-Top-K vs Top-K Ablation (4 runs, 540 steps)
+
+Isolate the effect of Gumbel noise on top-k training, using the best init from Group 2.
+
+| Run | Method | Init | Tau | Notes |
+|-----|--------|------|-----|-------|
+| **A1** | Top-K | best init | 0.5 | Deterministic threshold |
+| **A2** | Gumbel-Top-K | best init | 0.5 | Stochastic threshold via Gumbel noise |
+| **A3** | Gumbel-Top-K | best init | 1.0 | Higher tau = more exploration |
+| **A4** | Gumbel-Top-K | best init | 0.2 | Lower tau = sharper, less exploration |
+
+**What this answers:**
+- Does stochastic exploration (Gumbel noise) help or hurt compared to deterministic top-k?
+- How does tau interact with the noise? High tau + noise = very soft; low tau + noise = mostly deterministic with occasional boundary jitter
+
+**Hypothesis:** Gumbel noise helps at zero/random init (breaks symmetry faster) but adds unnecessary variance at linspace init (ordering is already good). At low tau the noise effect vanishes; at high tau the noise dominates and prevents convergence. Tau=0.5 should be the sweet spot.
+
+### Group 4: Neuron Reordering Analysis (post-hoc, no extra runs)
+
+Run on all completed experiments from Groups 1-3. This is analysis only, no additional training.
+
+For each run, after training:
+1. Extract final logit ranking per layer (argsort descending)
+2. Compare to initial logit ranking:
+   - **Kendall's tau** (rank correlation, -1 to +1): 1.0 = identical ordering, 0 = random
+   - **Top-k overlap**: fraction of top-k neurons at init that remain in top-k after training, for k ∈ {256, 512, 1024}
+   - **Per-layer reordering magnitude**: average absolute rank change per neuron
+
+**What this answers:**
+- In Phase 2 (prefix-sliced), 97-99% of ordering was preserved — the mask mostly learned per-layer width thresholds, not per-neuron importance. With full-width compute, is there more reordering?
+- Do layers reorder differently? (Phase 2 found layer 3 reordered most: 86% overlap vs 97-99% for layers 0-2)
+- Does unbiased init (zero/random) lead to more diverse per-layer orderings than linspace?
+
+**Expected:** Significantly more reordering than Phase 2 because neurons are no longer constrained to prefix positions. Random init should show the most reordering (no initial bias to preserve). Linspace init may still show less reordering because the initial ordering is a reasonable prior.
+
+### Group 5: Long-Run Validation (2-3 runs, 2700 steps)
+
+Promote the top 2-3 configs from Groups 1-3 to 2700-step runs. The critical question is whether the Phase 2 degradation pattern (+2.6% at 540 steps → +9% at 2700 steps for full model) is eliminated by the fix.
+
+| Run | Method | Init | Steps |
+|-----|--------|------|-------|
+| **L1** | Baseline (uniform MatFormer) | — | 2700 |
+| **L2** | Best from Groups 1-3 | — | 2700 |
+| **L3** | Second best from Groups 1-3 | — | 2700 |
+
+**What this answers:**
+- Does the fix prevent the full-model degradation that worsened over training? (The +9% gap at 2700 steps was the main weakness of Phase 2)
+- Do the sub-model improvements hold at longer training? (Phase 2 showed gains at 1/2, 1/4, 1/8 at 540 steps — do they persist?)
+- Does neuron reordering increase with more training time?
+
+**Success criteria:**
+- Full model (1/1): within 1% of baseline (vs +9% in Phase 2 at 2700 steps)
+- Sub-models (1/2, 1/4, 1/8): beat baseline (vs +4.4%, +3.4%, +2.3% worse in Phase 2)
+- Neuron reordering: measurably different from Phase 2's 97-99% preservation
+
+### Run Schedule
+
+Total: 15-18 short runs + 2-3 long runs = 17-21 runs.
+
+With 8 GPUs and 1 GPU per 540-step run (~15 min each), Groups 1-3 can be run in 3 batches:
+
+```
+Batch 1 (8 GPUs): V1, V2, V3, G1, G2, G3, G4, T1     ~15 min
+Batch 2 (8 GPUs): T2, T3, T4, A1, A2, A3, A4, [spare]  ~15 min
+Batch 3 (2-3 GPUs): L1, L2, L3                           ~75 min (2700 steps)
+```
+
+Analysis (Group 4) runs post-hoc on CPU using saved checkpoints.
+
+### Summary of Key Questions
+
+| # | Question | Experiments | Expected outcome |
+|---|----------|-------------|------------------|
+| 1 | Does the fix work? | V1-V3 | Similar or better than pre-fix at linspace init |
+| 2 | Can methods learn from unbiased init? | G1-G4, T1-T4 | Yes — zero/random should work now |
+| 3 | Is linspace still best, or just a crutch? | G1-G4, T1-T4 | Random may match or beat linspace |
+| 4 | Does Gumbel noise help top-k? | A1-A4 | Helps at unbiased init, neutral at linspace |
+| 5 | Does the fix eliminate long-run degradation? | L1-L3 | Full-model gap drops from +9% to <1% |
+| 6 | Do neurons genuinely reorder now? | Group 4 analysis | Significantly more reordering than Phase 2's 97-99% preservation |

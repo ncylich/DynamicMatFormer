@@ -34,28 +34,49 @@ class GumbelMaskLayer(nn.Module):
         with torch.no_grad():
             self.logits.copy_(new_logits)
 
-    def forward(self, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
+    def forward(self, tau: float = 1.0, hard: bool = False, k: Optional[int] = None) -> torch.Tensor:
         """
         Produce a mask in [0,1] (soft) or {0,1} (hard).
 
+        Supports two modes depending on whether k is provided:
+        - k=None: Vanilla Gumbel-Sigmoid (per-element sigmoid, used with budget penalty).
+        - k < mlp_dim: Gumbel-Top-K hybrid (top-k threshold on noisy logits,
+          factor-dependent width, no budget penalty needed).
+        - k >= mlp_dim: All-ones (no masking at full model width).
+
         Args:
-            tau: Gumbel-Sigmoid temperature. High = soft, low = hard.
+            tau: Temperature. High = soft, low = hard.
             hard: If True, use straight-through estimator for discrete masks.
+            k: Target sub-model width for Gumbel-Top-K. None for vanilla Gumbel-Sigmoid.
 
         Returns:
             Tensor of shape (mlp_dim,) with values in [0,1] or {0,1}.
         """
+        if k is not None and k >= self.mlp_dim:
+            # Full model — return all-ones, no mask overhead
+            return torch.ones_like(self.logits)
+
+        # Add Gumbel noise during training (shared by both modes)
         if self.training and not hard:
-            # Gumbel-Sigmoid: sample Gumbel noise and apply sigmoid with temperature
             u = torch.rand_like(self.logits).clamp(1e-6, 1.0 - 1e-6)
             gumbel_noise = -torch.log(-torch.log(u))
-            y_soft = torch.sigmoid((self.logits + gumbel_noise) / tau)
+            noisy_logits = self.logits + gumbel_noise
         else:
-            y_soft = torch.sigmoid(self.logits / tau)
+            noisy_logits = self.logits
+
+        if k is not None and k < self.mlp_dim:
+            # Gumbel-Top-K: factor-dependent width via top-k threshold on noisy logits.
+            # Selects ~k neurons by finding the k-th largest noisy logit as threshold.
+            topk_vals, _ = noisy_logits.topk(k, sorted=False)
+            threshold = topk_vals.min()
+            y_soft = torch.sigmoid((noisy_logits - threshold) / tau)
+        else:
+            # Vanilla Gumbel-Sigmoid: per-element sigmoid
+            y_soft = torch.sigmoid(noisy_logits / tau)
 
         if hard:
             # Straight-through estimator: hard in forward, soft in backward
-            y_hard = (y_soft > 0.5).float()
+            y_hard = (y_soft >= 0.5).float()
             return y_hard - y_soft.detach() + y_soft
         return y_soft
 
@@ -77,9 +98,10 @@ class GumbelMaskManager(nn.Module):
             for _ in range(n_layers)
         ])
 
-    def get_mask(self, layer_idx: int, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
-        """Get the mask for a specific layer."""
-        return self.masks[layer_idx](tau=tau, hard=hard)
+    def get_mask(self, layer_idx: int, tau: float = 1.0, hard: bool = False,
+                 k: Optional[int] = None) -> torch.Tensor:
+        """Get the mask for a specific layer at a given sub-model width."""
+        return self.masks[layer_idx](tau=tau, hard=hard, k=k)
 
     def budget_loss(self, target: float) -> torch.Tensor:
         """

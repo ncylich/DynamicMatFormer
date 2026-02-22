@@ -457,7 +457,7 @@ class HMatConfig(BaseConfig):
     """Configuration for Heterogeneous Matryoshka (H-Mat)."""
 
     enabled: bool = True
-    method: str = "gumbel"  # "fisher" | "gumbel" | "fisher_gumbel" | "topk"
+    method: str = "gumbel"  # "fisher" | "gumbel" | "fisher_gumbel" | "topk" | "gumbel_topk"
 
     # Method A (Fisher) settings
     calibration_batches: int = 128
