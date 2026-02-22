@@ -34,6 +34,7 @@ from .eval import Evaluator
 from .exceptions import OlmoConfigurationError
 from .hmat.fisher_ema import FisherEMA
 from .hmat.gumbel import GumbelMaskManager
+from .hmat.topk import TopKMaskManager
 from .model import Olmo, MatformerManager
 from .optim import set_new_base_lr
 from .util import (
@@ -107,6 +108,8 @@ class Trainer:
     z_train_loss_metric: Optional[MeanMetric] = None
     gumbel_manager: Optional[GumbelMaskManager] = None
     gumbel_optim: Optional[torch.optim.Optimizer] = None
+    topk_manager: Optional[TopKMaskManager] = None
+    topk_optim: Optional[torch.optim.Optimizer] = None
     fisher_ema: Optional[FisherEMA] = None
     global_step: int = 0
     global_data_step: int = 0
@@ -129,6 +132,10 @@ class Trainer:
             state_dict["gumbel_manager"] = self.gumbel_manager.state_dict()
         if self.gumbel_optim is not None:
             state_dict["gumbel_optim"] = self.gumbel_optim.state_dict()
+        if self.topk_manager is not None:
+            state_dict["topk_manager"] = self.topk_manager.state_dict()
+        if self.topk_optim is not None:
+            state_dict["topk_optim"] = self.topk_optim.state_dict()
         return state_dict
 
     def non_tensor_state_dict(self) -> Dict[str, Any]:
@@ -417,6 +424,11 @@ class Trainer:
                     torch.save(self.gumbel_manager.state_dict(), checkpoint_dir_tmp / "gumbel.pt")
                 if self.gumbel_optim is not None:
                     torch.save(self.gumbel_optim.state_dict(), checkpoint_dir_tmp / "gumbel_optim.pt")
+                # Save TopK mask state if present.
+                if self.topk_manager is not None:
+                    torch.save(self.topk_manager.state_dict(), checkpoint_dir_tmp / "topk.pt")
+                if self.topk_optim is not None:
+                    torch.save(self.topk_optim.state_dict(), checkpoint_dir_tmp / "topk_optim.pt")
             barrier()
 
         if get_global_rank() == 0:
@@ -610,6 +622,8 @@ class Trainer:
         self.optim.zero_grad(set_to_none=True)
         if self.gumbel_optim is not None:
             self.gumbel_optim.zero_grad(set_to_none=True)
+        if self.topk_optim is not None:
+            self.topk_optim.zero_grad(set_to_none=True)
 
         # Reset metrics.
         self.ce_train_loss_metric.reset()
@@ -642,6 +656,16 @@ class Trainer:
                 tau_end = self.cfg.hmat.gumbel_tau_end
                 tau = tau_start * (tau_end / tau_start) ** progress
                 matmng.gumbel_tau = tau
+
+        # Update temperature if in topk mode (reuses gumbel_tau infrastructure).
+        if self.topk_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "topk":
+            matmng = MatformerManager.get_instance()
+            anneal_steps = self.cfg.hmat.gumbel_tau_anneal_steps or self.cfg.max_duration
+            progress = min(1.0, self.global_step / anneal_steps)
+            tau_start = self.cfg.hmat.gumbel_tau_start
+            tau_end = self.cfg.hmat.gumbel_tau_end
+            tau = tau_start * (tau_end / tau_start) ** progress
+            matmng.gumbel_tau = tau
 
         # Run forward-backward pass.
 
@@ -720,6 +744,8 @@ class Trainer:
         self.scheduler.step()
         if self.gumbel_optim is not None:
             self.gumbel_optim.step()
+        if self.topk_optim is not None:
+            self.topk_optim.step()
 
         if len(losses) > 1:
             metrics = {}
@@ -752,6 +778,17 @@ class Trainer:
             if self.cfg.hmat.method == "gumbel":
                 budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
                 metrics["gumbel/budget_penalty"] = budget_penalty.item()
+
+        # Log TopK metrics.
+        if self.topk_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "topk":
+            from .model import Activation
+            act = Activation.build(self.cfg.model)
+            mlp_dim = int(self.cfg.model.mlp_ratio * self.cfg.model.d_model * act.output_multiplier)
+            # Log at half-width as representative sub-model
+            k_half = mlp_dim // 2
+            metrics.update(self.topk_manager.log_summary(k=k_half))
+            matmng = MatformerManager.get_instance()
+            metrics["topk/tau"] = matmng.gumbel_tau
 
         # Update min train loss and see if we should stop early.
         self.min_train_loss = min(self.min_train_loss, ce_batch_loss.item())  # type: ignore
@@ -975,11 +1012,48 @@ class Trainer:
                 f"lambda={self.cfg.hmat.budget_penalty_lambda}"
             )
 
+    def init_topk(self):
+        """Initialize TopK mask manager if configured."""
+        if not self.cfg.hmat.enabled or self.cfg.hmat.method != "topk":
+            return
+
+        from .model import Activation
+        act = Activation.build(self.cfg.model)
+        mlp_dim = int(self.cfg.model.mlp_ratio * self.cfg.model.d_model * act.output_multiplier)
+
+        self.topk_manager = TopKMaskManager(
+            n_layers=self.cfg.model.n_layers,
+            mlp_dim=mlp_dim,
+            init_scale=self.cfg.hmat.gumbel_init_scale,
+        ).to(self.device)
+
+        # Separate optimizer for topk logits (same pattern as Phase 2 gumbel)
+        self.topk_optim = torch.optim.AdamW(
+            self.topk_manager.parameters(),
+            lr=self.cfg.optimizer.learning_rate,
+            weight_decay=0.0,
+            betas=tuple(self.cfg.optimizer.betas),
+        )
+
+        matmng = MatformerManager.get_instance()
+        matmng.mode = "topk"
+        matmng.topk_masks = self.topk_manager
+        matmng.gumbel_tau = self.cfg.hmat.gumbel_tau_start
+
+        log.info(
+            f"Initialized TopKMaskManager: {self.cfg.model.n_layers} layers, "
+            f"mlp_dim={mlp_dim}, init_scale={self.cfg.hmat.gumbel_init_scale}, "
+            f"tau_start={self.cfg.hmat.gumbel_tau_start}"
+        )
+
     def fit(self):
         start_time = time.time()
 
         # Initialize Gumbel masks if configured.
         self.init_gumbel()
+
+        # Initialize TopK masks if configured.
+        self.init_topk()
 
         if self.cfg.load_path is not None and self.global_step > 0 and self.cfg.eval_on_load:
             eval_metrics = self.eval()

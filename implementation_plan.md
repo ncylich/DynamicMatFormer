@@ -835,7 +835,7 @@ The gap **narrows monotonically** at higher compression (9% → 4.4% → 3.4% �
 
 ---
 
-## Phase 2.5: Fisher-Guided Gumbel Masking (Saliency-Driven Allocation)
+## Phase 2.1: Fisher-Guided Gumbel Masking (Saliency-Driven Allocation)
 
 ### Motivation
 
@@ -845,7 +845,7 @@ Phase 2's core weakness: Gumbel logits are learned via backprop through a budget
 
 ### How It Differs from Phase 2
 
-| Aspect | Phase 2 (Learned Gumbel) | Phase 2.5 (Fisher-Guided Gumbel) |
+| Aspect | Phase 2 (Learned Gumbel) | Phase 2.1 (Fisher-Guided Gumbel) |
 |--------|--------------------------|----------------------------------|
 | Logit source | Learned via backprop + budget penalty | Set from Fisher saliency EMA |
 | Mask parameters | Learnable `nn.Parameter` | Non-learnable, externally updated |
@@ -901,7 +901,7 @@ This is the same Gumbel-Sigmoid + temperature annealing infrastructure from Phas
 
 5. **Fisher score computation:** Per-dimension, summing squared gradients from both `ff_proj` rows and `ff_out` columns (same formula as Phase 1's `compute_fisher_saliency`). Computed from gradients that already exist after backward — zero extra forward/backward passes.
 
-### 2.5.1 Fisher EMA Accumulator
+### 2.1.1 Fisher EMA Accumulator
 
 **File:** `olmo/hmat/fisher_ema.py` (new)
 
@@ -951,11 +951,11 @@ class FisherEMA:
         return logits
 ```
 
-### 2.5.2 Modify GumbelMaskLayer for External Logit Updates
+### 2.1.2 Modify GumbelMaskLayer for External Logit Updates
 
 **File:** `olmo/hmat/gumbel.py` (modify)
 
-The existing `GumbelMaskLayer` stores logits as `nn.Parameter`. For Phase 2.5, logits are set externally and should **not** be learnable:
+The existing `GumbelMaskLayer` stores logits as `nn.Parameter`. For Phase 2.1, logits are set externally and should **not** be learnable:
 
 ```python
 class GumbelMaskLayer(nn.Module):
@@ -977,7 +977,7 @@ class GumbelMaskLayer(nn.Module):
 
 The forward pass (Gumbel-Sigmoid + temperature) remains identical.
 
-### 2.5.3 Integrate into Training Loop
+### 2.1.3 Integrate into Training Loop
 
 **File:** `olmo/train.py` (modify)
 
@@ -1031,7 +1031,7 @@ if self.cfg.hmat.method == "fisher_gumbel":
     # ...
 ```
 
-### 2.5.4 Config Extensions
+### 2.1.4 Config Extensions
 
 **File:** `olmo/config.py` (modify `HMatConfig`)
 
@@ -1041,17 +1041,17 @@ class HMatConfig(BaseConfig):
     # ... existing fields ...
     method: str = "fisher"  # "fisher" | "gumbel" | "fisher_gumbel"
 
-    # Phase 2.5 (Fisher-Guided Gumbel) settings
+    # Phase 2.1 (Fisher-Guided Gumbel) settings
     fisher_ema_beta: float = 0.99           # EMA decay for Fisher scores
     fisher_warmup_frac: float = 0.05        # Fraction of training for warmup (no masks)
     fisher_update_interval: int = 50        # Update logits from Fisher EMA every K steps
 ```
 
-### 2.5.5 Forward Pass
+### 2.1.5 Forward Pass
 
 **No changes needed.** The existing `OlmoSequentialBlock.forward` already handles gumbel masks via `matmng.mode == "gumbel"`. During warmup, `matmng.mode` stays `"uniform"` so masks aren't applied. After warmup, it switches to `"gumbel"` and the same mask application logic runs.
 
-### Tests for Phase 2.5
+### Tests for Phase 2.1
 
 **File:** `tests/test_fisher_gumbel.py` (new)
 
@@ -1077,7 +1077,7 @@ class HMatConfig(BaseConfig):
 
 ---
 
-## Experimental Results: Phase 2.5 + Freeze Ablations (540 steps, pile-700M)
+## Experimental Results: Phase 2.1 + Freeze Ablations (540 steps, pile-700M)
 
 ### Freeze Experiment
 
@@ -1090,7 +1090,7 @@ class HMatConfig(BaseConfig):
 
 **Freeze conclusion:** The fixed schedule improved over the broken one (163.3 vs 167.3), but both are worse than no-freeze (157.7). At 540 steps, masks haven't differentiated enough from init for freeze to add value. Freeze may help at longer training (2700+ steps) where masks diverge significantly.
 
-### Fisher-Gumbel (Phase 2.5) Ablation Study
+### Fisher-Gumbel (Phase 2.1) Ablation Study
 
 All ablations use fisher_gumbel method with 15% warmup (81 steps) as the base config.
 
@@ -1117,3 +1117,337 @@ All ablations use fisher_gumbel method with 15% warmup (81 steps) as the base co
 The fundamental limitation of Fisher-gumbel is **hypothesis #6: no gradient signal on masks**. In learned gumbel (Phase 2), the CE loss gradient flows directly through the mask values, telling each dimension exactly how much it should be on/off. Fisher-gumbel only has an indirect heuristic (squared gradients → rank → logits) with no closed-loop feedback. The 7+ PPL gap (157.7 vs 164.8 best) reflects this structural disadvantage.
 
 **Phase 2 with learned gumbel masks (scale=1.1, tau=0.5, lambda=0.001) remains the best approach**, outperforming baseline MatFormer at all compressed sub-model sizes while staying within 1.2% at full width.
+
+---
+
+## Phase 2.2: Soft Top-K Structural Sparsity
+
+### Motivation
+
+Phase 2's Gumbel-Sigmoid masks have a fundamental design problem: each neuron independently decides on/off via `sigmoid(logit)`, and a budget penalty (`budget_penalty_lambda * |mean_active - target|`) is the only thing controlling total sparsity. This creates two issues:
+
+1. **Competing objectives.** The budget penalty fights the CE loss. At `lambda=0.001` (best found), it's weak enough to avoid hurting training — but also weak enough that active fractions drift. The model must waste gradient signal balancing two losses instead of focusing on language modeling.
+
+2. **Soft scaling, not selection.** During training, every neuron is multiplied by a value in [0, 1], not selected or dropped. Even "fully on" neurons get scaled by ~0.75 (`sigmoid(1.1) ≈ 0.75`). This persistent capacity drag is the root cause of the full-model PPL degradation that worsens from +1.2% at 540 steps to +9% at 2700 steps.
+
+**Key insight:** We don't need each neuron to independently decide its importance. We need to pick the top-K most important neurons per layer — a *structural* constraint, not a *regularized* one. A differentiable top-k operation guarantees exactly K active dimensions by construction, eliminating the budget penalty entirely and producing masks that are closer to binary even during training.
+
+### How It Differs from Phase 2
+
+| Aspect | Phase 2 (Gumbel-Sigmoid) | Phase 2.2 (Soft Top-K) |
+|--------|--------------------------|------------------------|
+| Mask mechanism | Per-element `sigmoid(logit + noise)` | Differentiable top-k with threshold |
+| Sparsity enforcement | Budget penalty (competing loss) | **Structural** (exactly K dims active) |
+| Budget penalty | Required (`lambda` hyperparameter) | **Eliminated** |
+| Mask values during training | Smooth [0, 1] — never truly binary | Near-binary — sharp transition at threshold |
+| Full-model behavior | All neurons scaled by ~0.75 | Top-K neurons ≈ 1.0, rest ≈ 0.0 |
+| Hyperparameters | tau, lambda, target | tau only (K is derived from factor) |
+| Per-layer budget | Soft (penalty pushes toward target) | **Hard** (exactly K per layer, or learnable K) |
+
+### Algorithm
+
+The core operation: given a logit vector of length `mlp_dim` and a target count `k`, produce a differentiable mask that is ~1 for the top-k logits and ~0 for the rest.
+
+```
+Forward pass:
+  1. Compute threshold = k-th largest logit (differentiable via soft sorting)
+  2. mask = sigmoid((logits - threshold) / tau)
+  3. If hard mode: apply straight-through estimator
+
+Backward pass:
+  - Gradients flow through sigmoid and through the threshold computation
+  - Logits above threshold get gradient pushing them higher (stay selected)
+  - Logits below threshold get gradient pushing them higher (compete for selection)
+  - The threshold itself shifts based on the aggregate gradient signal
+```
+
+**How K is determined per layer:** When the MatFormer training loop iterates over factors {1, 2, 4, 8}, at factor=f the sub-model uses `mlp_dim / f` output dimensions (after SwiGLU). The soft top-k mask at factor=f selects exactly `k = mlp_dim_out / f` dimensions. At factor=1 (full model), `k = mlp_dim_out` and the mask is all-ones — **the full model is never degraded**.
+
+This naturally gives us the asymmetric property: factor=1 has no mask overhead, and sub-models get structurally enforced allocation.
+
+### 2.2.1 Soft Top-K Mask Module
+
+**New file:** `olmo/hmat/topk.py`
+
+```python
+class TopKMaskLayer(nn.Module):
+    """
+    Per-layer learnable importance gate using differentiable top-k.
+
+    Instead of per-element sigmoid (Gumbel), this computes a soft threshold
+    at the k-th largest logit value and applies sigmoid relative to that
+    threshold. Guarantees exactly k dimensions are active at convergence.
+    """
+
+    def __init__(self, mlp_dim: int, init_scale: float = 1.1):
+        super().__init__()
+        self.mlp_dim = mlp_dim
+        # Same linear decay init as Phase 2 — first dims important, last dims not
+        self.logits = nn.Parameter(torch.linspace(init_scale, -init_scale, mlp_dim))
+
+    def forward(self, k: int, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
+        """
+        Produce a mask with ~k active dimensions.
+
+        Args:
+            k: Target number of active dimensions for this sub-model width.
+            tau: Temperature. Lower = sharper transition at threshold.
+            hard: If True, use straight-through estimator for {0, 1} masks.
+
+        Returns:
+            Tensor of shape (mlp_dim,) with ~k values near 1 and the rest near 0.
+        """
+        if k >= self.mlp_dim:
+            # Full model — return all-ones, no mask overhead
+            return torch.ones_like(self.logits)
+
+        # Find the soft threshold: the k-th largest logit
+        # topk returns (values, indices), we want the smallest of the top-k
+        topk_vals, _ = self.logits.topk(k, sorted=False)
+        threshold = topk_vals.min()  # k-th largest logit
+
+        # Soft mask: sigmoid of (logit - threshold) / tau
+        # Dims above threshold → sigmoid > 0.5 → "on"
+        # Dims below threshold → sigmoid < 0.5 → "off"
+        y_soft = torch.sigmoid((self.logits - threshold) / tau)
+
+        if hard:
+            y_hard = (y_soft > 0.5).float()
+            return y_hard - y_soft.detach() + y_soft
+        return y_soft
+
+    def get_active_fraction(self, k: int) -> float:
+        """Return fraction of dims that would be selected for top-k."""
+        with torch.no_grad():
+            mask = self.forward(k, tau=0.01, hard=True)
+            return mask.mean().item()
+
+
+class TopKMaskManager(nn.Module):
+    """Manages top-k masks for all layers in the model."""
+
+    def __init__(self, n_layers: int, mlp_dim: int, init_scale: float = 1.1):
+        super().__init__()
+        self.n_layers = n_layers
+        self.mlp_dim = mlp_dim
+        self.masks = nn.ModuleList([
+            TopKMaskLayer(mlp_dim, init_scale=init_scale)
+            for _ in range(n_layers)
+        ])
+
+    def get_mask(self, layer_idx: int, k: int, tau: float = 1.0,
+                 hard: bool = False) -> torch.Tensor:
+        """Get the mask for a specific layer at a specific sub-model width."""
+        return self.masks[layer_idx](k=k, tau=tau, hard=hard)
+
+    def get_layer_widths(self, k: int) -> Dict[int, int]:
+        """For a given target k, return actual active dim count per layer."""
+        widths = {}
+        with torch.no_grad():
+            for i, mask_layer in enumerate(self.masks):
+                hard_mask = mask_layer.forward(k, tau=0.01, hard=True)
+                widths[i] = int(hard_mask.sum().item())
+        return widths
+
+    def log_summary(self, k: int) -> Dict[str, float]:
+        """Return summary metrics for logging at a given sub-model width."""
+        metrics = {}
+        with torch.no_grad():
+            for i, mask_layer in enumerate(self.masks):
+                frac = mask_layer.get_active_fraction(k)
+                metrics[f"topk/layer_{i}_active_frac_at_{k}"] = frac
+        return metrics
+```
+
+### 2.2.2 Integrate into Forward Pass
+
+**File:** `olmo/model.py` — `OlmoSequentialBlock.forward`
+
+The key difference from Phase 2: the mask takes `k` as input (derived from the current factor), and at factor=1 it returns all-ones with no computation.
+
+```python
+# In OlmoSequentialBlock.forward:
+factor = self.matmng.get_factor_for_layer(self.layer_idx)
+use_topk = self.matmng.mode == "topk" and self.matmng.topk_masks is not None
+
+if factor == 1:
+    h = self.act(self.ff_proj(self.ff_norm(x)))
+    if use_topk:
+        # k = full mlp_dim_out → returns all-ones, zero overhead
+        pass  # No mask at full width
+    x = x + self.dropout(self.ff_out(h))
+else:
+    n = self.ff_proj.weight.shape[0]
+    k = int(n / factor)
+    w_proj = self.ff_proj.weight[:k]
+    b_proj = self.ff_proj.bias[:k]
+    k_out = int(k * self.act.output_multiplier)
+    w_out = self.ff_out.weight[:, :k_out]
+    b_out = self.ff_out.bias
+
+    h = self.act(F.linear(self.ff_norm(x), w_proj, b_proj))
+    if use_topk:
+        tau = self.matmng.gumbel_tau  # Reuse tau infrastructure
+        mask = self.matmng.topk_masks.get_mask(
+            self.layer_idx, k=k_out, tau=tau, hard=not self.training
+        )
+        h = h * mask[:k_out].unsqueeze(0).unsqueeze(0)
+    x = x + self.dropout(F.linear(h, w_out, b_out))
+```
+
+**Critical property:** At factor=1, no mask is applied. The full model trains at 100% capacity with zero interference — the asymmetric property comes for free from the `k >= mlp_dim` check in `TopKMaskLayer.forward`.
+
+### 2.2.3 Integrate into Training Loop
+
+**File:** `olmo/train.py`
+
+Changes are smaller than Phase 2 because there is no budget penalty to compute:
+
+```python
+# In init_gumbel() or new init_topk():
+if self.cfg.hmat.method == "topk":
+    mlp_dim = self.cfg.model.mlp_ratio * self.cfg.model.d_model
+    output_multiplier = Activation.build(self.cfg.model).output_multiplier
+    mlp_dim_out = int(mlp_dim * output_multiplier)
+
+    self.topk_manager = TopKMaskManager(
+        n_layers=self.cfg.model.n_layers,
+        mlp_dim=mlp_dim_out,
+        init_scale=self.cfg.hmat.gumbel_init_scale,
+    )
+
+    # Separate optimizer (same pattern as Phase 2)
+    self.topk_optim = torch.optim.AdamW(
+        self.topk_manager.parameters(),
+        lr=self.cfg.optimizer.learning_rate,
+        weight_decay=0.0,
+    )
+
+    matmng = MatformerManager.get_instance()
+    matmng.mode = "topk"
+    matmng.topk_masks = self.topk_manager
+    matmng.gumbel_tau = self.cfg.hmat.gumbel_tau_start
+
+# In train_step — temperature annealing:
+if self.cfg.hmat.method == "topk":
+    # Same exponential tau annealing as Phase 2
+    progress = min(1.0, self.global_step / anneal_steps)
+    tau = tau_start * (tau_end / tau_start) ** progress
+    matmng.gumbel_tau = tau
+
+# In train_step — after loss.backward():
+if self.topk_optim is not None:
+    self.topk_optim.step()
+    self.topk_optim.zero_grad()
+
+# In train_step — loss computation:
+# NO budget penalty! The loss is just CE + Z-loss (same as baseline).
+# Sparsity is structural — exactly k dims active by construction.
+```
+
+**What's removed vs Phase 2:**
+- No `budget_loss()` call
+- No `budget_penalty_lambda` in loss
+- No `budget_penalty_target` config
+
+### 2.2.4 Gradient Flow Analysis
+
+The soft top-k threshold creates a gradient path that differs from Gumbel-Sigmoid:
+
+**Gumbel-Sigmoid (Phase 2):** Each logit gets gradient independently via `sigmoid'(logit / tau)`. Logits near 0 get the strongest gradient (sigmoid is steepest there). Logits far from 0 get vanishing gradient (sigmoid saturates). The budget penalty adds a uniform push toward/away from 0.
+
+**Soft Top-K (Phase 2.2):** Each logit gets gradient via `sigmoid'((logit - threshold) / tau)`. The key difference:
+- **Logits near the threshold** get the strongest gradient — these are the "boundary" neurons competing for the k-th slot
+- **Logits far above threshold** get near-zero gradient (already confidently selected)
+- **Logits far below threshold** get near-zero gradient (already confidently rejected)
+- The **threshold itself** shifts based on the CE loss gradient: if the loss wants more capacity, the threshold drops (admitting more neurons); if it can tolerate less, the threshold rises
+
+This concentrates gradient signal on the *decision boundary* — the neurons that are actually contested. Phase 2's Gumbel-Sigmoid wastes gradient on neurons that are clearly on or clearly off.
+
+**Potential issue:** The `topk` + `min` operations involve a sort, which has zero gradient for tied values. In practice, logits are initialized with `linspace` so ties don't occur at init, and gradient updates push them apart over training. If ties become a problem, adding small uniform noise to logits before the topk resolves it.
+
+### 2.2.5 Config Extensions
+
+**File:** `olmo/config.py` — `HMatConfig`
+
+```python
+@dataclass
+class HMatConfig(BaseConfig):
+    # ... existing fields ...
+    method: str = "fisher"  # "fisher" | "gumbel" | "fisher_gumbel" | "topk"
+
+    # Phase 2.2 (Soft Top-K) — reuses these existing fields:
+    #   gumbel_tau_start, gumbel_tau_end, gumbel_tau_anneal_steps
+    #   gumbel_init_scale
+    # No new fields needed — budget_penalty_lambda and budget_penalty_target
+    # are simply unused when method="topk"
+```
+
+No new hyperparameters. The method reuses `gumbel_init_scale` for logit initialization and `gumbel_tau_*` for temperature annealing. The `budget_penalty_*` fields are ignored.
+
+### 2.2.6 Training Config
+
+**New file:** `configs/pile-tiny-hmat-topk.yaml`
+
+```yaml
+# Extends pile-tiny.yaml with Soft Top-K H-Mat
+matformer_factor: 8
+hmat:
+  enabled: true
+  method: topk
+  gumbel_tau_start: 0.5        # Same best tau from Phase 2
+  gumbel_tau_end: 0.1
+  gumbel_init_scale: 1.1       # Same best scale from Phase 2
+  # No budget_penalty_lambda or budget_penalty_target needed
+```
+
+### Tests for Phase 2.2
+
+**File:** `tests/test_topk.py`
+
+1. **test_topk_mask_shape:** Verify mask output has shape `(mlp_dim,)` for various k values.
+2. **test_topk_mask_count:** At low tau with hard=True, verify exactly k dims are 1 and the rest are 0.
+3. **test_topk_full_width_identity:** When `k >= mlp_dim`, verify mask is all-ones (no degradation).
+4. **test_topk_gradient_flows_to_logits:** Run forward + CE loss + backward, verify `logits.grad` is not None.
+5. **test_topk_gradient_concentrated_at_boundary:** With known logits, verify gradient magnitude is highest for logits near the threshold, near-zero for logits far from threshold.
+6. **test_topk_temperature_effect:** High tau → soft transition; low tau → sharp near-binary transition.
+7. **test_topk_different_k_per_factor:** In a single training step with factors {1,2,4,8}, verify each factor gets the correct k and the correct mask behavior.
+8. **test_topk_no_budget_penalty:** Verify that training with method="topk" does NOT add any budget penalty to the loss.
+9. **test_topk_ordering_preserved:** After several optimizer steps, verify that the relative ordering of logits changes (the model learns which dims matter), but the total active count at each k stays at k.
+10. **test_topk_checkpoint_roundtrip:** Save and load topk state, verify logits are preserved.
+11. **test_topk_forward_backward_integration:** Full integration test: build model, attach TopKMaskManager, run forward+backward at multiple factors, verify shapes and gradients.
+12. **test_topk_vs_gumbel_at_factor1:** Verify that at factor=1, top-k produces identical output to an unmasked baseline (unlike Phase 2's Gumbel which scales by ~0.75).
+
+### Expected Advantages Over Phase 2
+
+1. **No full-model degradation.** At factor=1, `k = mlp_dim` → all-ones mask. The full model trains identically to baseline MatFormer. This directly addresses the +1.2% → +9% degradation pattern.
+
+2. **No budget penalty hyperparameter.** The `lambda` and `target` parameters are eliminated. One fewer competing objective, one fewer hyperparameter to tune.
+
+3. **Near-binary masks during training.** At reasonable tau (0.5), the sigmoid transition around the threshold is sharp. Neurons well above threshold get mask ≈ 1.0, not ≈ 0.75. This preserves more effective capacity during training.
+
+4. **Gradient efficiency.** Gradient signal is concentrated on contested boundary neurons rather than spread across all neurons. The optimization problem is simpler: decide the ordering, not the absolute scale.
+
+5. **Exact sparsity at inference.** Hard top-k gives exactly k active dims — no need to threshold and hope the count is close to target. Deployment is deterministic.
+
+### Risks and Mitigations
+
+1. **Threshold discontinuity.** The k-th largest logit shifts discretely when two logits swap rank. This could cause oscillation at the boundary.
+   - *Mitigation:* Temperature smoothing (tau > 0) creates a soft transition zone. At tau=0.5, logits within ~1.0 of the threshold contribute partially, so small rank swaps don't cause sharp mask changes.
+
+2. **`topk` gradient.** PyTorch's `topk` does not propagate gradients through the selection. But we don't need it to — gradients flow through the `sigmoid((logits - threshold) / tau)` computation. The threshold is computed in the forward pass as `topk(...).min()`, and `min` does propagate gradients (to the single element that achieved the minimum).
+   - *Caveat:* Only the logit at exactly the threshold gets gradient from the threshold path. All other logits get gradient only from the `sigmoid(logit - threshold.detach())` term if we detach, or from both terms if we don't. Empirically, not detaching should work because the threshold shifts slowly.
+
+3. **No inter-layer allocation flexibility.** Every layer gets exactly k active dims at factor=f. Unlike Phase 2 where one layer could have 60% active and another 40% at the same factor, here they all have the same count.
+   - *Mitigation:* The *ordering* of neurons within each layer is still learned. Layer 0 might prioritize dims 0-50 while layer 3 prioritizes dims 200-250. The mask is per-layer, so each layer picks its own top-k from a different learned importance ordering. The reallocation happens through *which* dims are selected, not *how many*.
+   - *Future extension:* Learnable per-layer k values (see "Per-Layer Budget Learning" below).
+
+### Future Extension: Per-Layer Budget Learning
+
+The simplest form of Phase 2.2 uses the same k at every layer for a given factor. A natural extension is to learn per-layer k values subject to a total budget constraint:
+
+```
+Constraint: sum(k_l for all layers l) = total_budget
+```
+
+This could be implemented as a higher-level Gumbel-Softmax over a small discrete set of per-layer budgets (e.g., each layer chooses from {k/4, k/2, k, 2k}), with the constraint enforced via a Lagrangian. This recovers the heterogeneous allocation from Phase 2 but with structural sparsity at each layer. This is left as a follow-up if Phase 2.2 baseline results are promising.

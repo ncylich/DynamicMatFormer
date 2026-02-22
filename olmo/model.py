@@ -49,9 +49,10 @@ class MatformerManager:
     def initialize(self):
         self.current_factor = 1            # Backward-compat: uniform factor
         self.layer_factors = None          # Dict[int, int] or None: per-layer factors
-        self.mode = "uniform"              # "uniform" | "heterogeneous" | "gumbel"
+        self.mode = "uniform"              # "uniform" | "heterogeneous" | "gumbel" | "topk"
         self.gumbel_masks = None           # For Method B: per-layer soft masks
         self.gumbel_tau = 1.0              # Current Gumbel temperature
+        self.topk_masks = None             # For Phase 2.2: per-layer top-k masks
 
     @classmethod
     def get_instance(cls):
@@ -444,6 +445,7 @@ class OlmoSequentialBlock(OlmoBlock):
         # shape: (batch_size, seq_len, d_model)
         factor = self.matmng.get_factor_for_layer(self.layer_idx)
         use_gumbel = self.matmng.mode == "gumbel" and self.matmng.gumbel_masks is not None
+        use_topk = self.matmng.mode == "topk" and self.matmng.topk_masks is not None
 
         if use_gumbel:
             tau = self.matmng.gumbel_tau
@@ -455,6 +457,7 @@ class OlmoSequentialBlock(OlmoBlock):
             h = self.act(self.ff_proj(self.ff_norm(x)))
             if use_gumbel:
                 h = h * mask.unsqueeze(0).unsqueeze(0)
+            # topk at factor=1: k >= mlp_dim → all-ones mask, no overhead
             x = x + self.dropout(self.ff_out(h))
         else:
             n = self.ff_proj.weight.shape[0]
@@ -470,6 +473,12 @@ class OlmoSequentialBlock(OlmoBlock):
             if use_gumbel:
                 # Slice mask to match the sub-model width (preserves nesting)
                 h = h * mask[:k_out].unsqueeze(0).unsqueeze(0)
+            if use_topk:
+                tau = self.matmng.gumbel_tau  # Reuse tau infrastructure
+                topk_mask = self.matmng.topk_masks.get_mask(
+                    self.layer_idx, k=k_out, tau=tau, hard=not self.training
+                )
+                h = h * topk_mask[:k_out].unsqueeze(0).unsqueeze(0)
             x = x + self.dropout(F.linear(h, w_out, b_out))
 
         return x, cache

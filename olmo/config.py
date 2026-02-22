@@ -456,8 +456,8 @@ class CheckpointType(StrEnum):
 class HMatConfig(BaseConfig):
     """Configuration for Heterogeneous Matryoshka (H-Mat)."""
 
-    enabled: bool = False
-    method: str = "fisher"  # "fisher" | "gumbel"
+    enabled: bool = True
+    method: str = "gumbel"  # "fisher" | "gumbel" | "fisher_gumbel" | "topk"
 
     # Method A (Fisher) settings
     calibration_batches: int = 128
@@ -467,7 +467,7 @@ class HMatConfig(BaseConfig):
     gumbel_tau_start: float = 2.0
     gumbel_tau_end: float = 0.1
     gumbel_tau_anneal_steps: int = 0  # 0 = use max_duration
-    budget_penalty_lambda: float = 0.01
+    budget_penalty_lambda: float = 0.001
     budget_penalty_target: float = 0.5
     gumbel_init_scale: float = 1.1  # linspace(+scale, -scale) → sigmoid range [~0.25, ~0.75]
     gumbel_freeze_fraction: float = 0.0  # Freeze masks + switch to hard for last X% of training

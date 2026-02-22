@@ -1,0 +1,103 @@
+run_name: hmat-topk-tiny-17M
+seed: 6198
+dry_run: false
+
+model:
+  d_model: 256
+  n_heads: 8
+  n_layers: 4
+  mlp_ratio: 8
+  alibi: true
+  alibi_bias_max: 8.0
+  flash_attention: false
+  attention_dropout: 0.0
+  attention_layer_norm: false
+  multi_query_attention: true
+  block_type: sequential
+  layer_norm_type: low_precision
+  activation_type: gelu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 2048
+  include_bias: true
+
+  vocab_size: 50277
+  embedding_size: 50304
+  eos_token_id: 50276
+  pad_token_id: 50276
+  init_device: meta
+  init_std: 0.02
+
+optimizer:
+  name: adamw
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
+
+scheduler:
+  name: cosine_with_warmup
+  t_warmup: 50
+  alpha_f: 0.1
+
+data:
+  paths: ${path.glob:/mnt/data/noahcylich/data/pile/train/*.npy}
+  pad_direction: right
+  num_workers: 2
+  drop_last: true
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: true
+  timeout: 0
+
+tokenizer:
+  identifier: EleutherAI/gpt-neox-20b
+  truncate_direction: right
+
+save_folder: /mnt/data/noahcylich/checkpoints/hmat-topk-tiny-17M
+save_overwrite: true
+save_interval: 10000000
+save_num_checkpoints_to_keep: 0
+save_interval_unsharded: 600
+save_num_unsharded_checkpoints_to_keep: 2
+
+load_path: null
+
+# Same schedule as baseline: 8x params (17.7M) = 141M tokens / (128 * 2048) = 539 steps
+max_duration: 540
+global_train_batch_size: 128
+device_train_microbatch_size: 16
+
+precision: amp_bf16
+
+max_grad_norm: 1.0
+
+speed_monitor:
+  window_size: 20
+
+console_log_interval: 10
+matformer_factor: 8
+
+# H-Mat Soft Top-K configuration
+hmat:
+  enabled: true
+  method: topk
+  gumbel_tau_start: 0.5         # Same best tau from Phase 2
+  gumbel_tau_end: 0.1
+  gumbel_init_scale: 1.1        # Same best scale from Phase 2
+  # No budget_penalty_lambda or budget_penalty_target needed
+
+eval_interval: 100
+eval_subset_num_batches: 10
+device_eval_batch_size: 16
+evaluators:
+  - label: pile-val
+    subset_num_batches: 10
+    data:
+      paths: ${path.glob:/mnt/data/noahcylich/data/pile/val/*.npy}
+      num_workers: 2
+      drop_last: true
+      pin_memory: true
+      persistent_workers: true
+      prefetch_factor: 4

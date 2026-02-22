@@ -1,0 +1,95 @@
+run_name: local-topk-17M
+seed: 6198
+dry_run: false
+
+model:
+  d_model: 256
+  n_heads: 8
+  n_layers: 4
+  mlp_ratio: 8
+  alibi: true
+  alibi_bias_max: 8.0
+  flash_attention: false
+  attention_dropout: 0.0
+  attention_layer_norm: false
+  multi_query_attention: true
+  block_type: sequential
+  layer_norm_type: low_precision
+  activation_type: gelu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 512
+  include_bias: true
+
+  vocab_size: 50277
+  embedding_size: 50304
+  eos_token_id: 50276
+  pad_token_id: 50276
+  init_device: cpu
+  init_std: 0.02
+
+optimizer:
+  name: adamw
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
+
+scheduler:
+  name: cosine_with_warmup
+  t_warmup: 20
+  alpha_f: 0.1
+
+# Point this at your local data (single .npy file is fine)
+# Generate synthetic: python -c "import numpy as np; np.random.randint(0,50277,500000,dtype=np.uint16).tofile('test_fixtures/synthetic_data/synthetic.npy')"
+data:
+  paths:
+  - test_fixtures/synthetic_data/synthetic.npy
+  pad_direction: right
+  num_workers: 0
+  drop_last: true
+  pin_memory: false
+  persistent_workers: false
+  timeout: 0
+
+tokenizer:
+  identifier: EleutherAI/gpt-neox-20b
+  truncate_direction: right
+
+save_folder: ./checkpoints/local-topk
+save_overwrite: true
+save_interval: 10000000
+save_num_checkpoints_to_keep: 0
+save_interval_unsharded: 10000
+save_num_unsharded_checkpoints_to_keep: 1
+
+load_path: null
+
+# MPS-compatible: batch=4, seq=512 fits in ~25GB unified memory
+# 69,120 steps = same token volume as VM's 540 steps at batch=128, seq=2048
+max_duration: 69120
+global_train_batch_size: 4
+device_train_microbatch_size: 4
+
+precision: fp32
+
+max_grad_norm: 1.0
+
+speed_monitor:
+  window_size: 20
+
+console_log_interval: 100
+matformer_factor: 8
+
+hmat:
+  enabled: true
+  method: topk
+  gumbel_tau_start: 0.5
+  gumbel_tau_end: 0.1
+  gumbel_init_scale: 1.1
+
+eval_interval: 5000
+eval_subset_num_batches: 5
+device_eval_batch_size: 4
+evaluators: []
