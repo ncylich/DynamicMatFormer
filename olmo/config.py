@@ -456,7 +456,7 @@ class CheckpointType(StrEnum):
 class HMatConfig(BaseConfig):
     """Configuration for Heterogeneous Matryoshka (H-Mat)."""
 
-    enabled: bool = True
+    enabled: bool = False
     method: str = "gumbel"  # "fisher" | "gumbel" | "fisher_gumbel" | "topk" | "gumbel_topk"
 
     # Method A (Fisher) settings
@@ -470,6 +470,9 @@ class HMatConfig(BaseConfig):
     budget_penalty_lambda: float = 0.001
     budget_penalty_target: float = 0.5
     gumbel_init_scale: float = 1.1  # linspace(+scale, -scale) → sigmoid range [~0.25, ~0.75]
+    gumbel_init_mode: str = "linspace"  # "linspace" | "zeros" | "normal" | "constant"
+    gumbel_init_value: float = 1.5  # Value for constant mode; std for normal mode
+    spread_penalty_lambda: float = 0.0  # Weight for spread loss: -var(logits) per layer (sharpens mask boundary)
     gumbel_freeze_fraction: float = 0.0  # Freeze masks + switch to hard for last X% of training
     vanilla_warmup_frac: float = 0.15  # Fraction of training to use vanilla (uniform) model before enabling masks
 

@@ -998,7 +998,7 @@ With the fix, the decreasing linspace init is no longer structurally necessary �
 
 ---
 
-## Phase 2.FIX.2: Gumbel Factor Independence
+## Phase 2.0.1 Fix: Gumbel Factor Independence
 
 ### Problem
 
@@ -1688,7 +1688,93 @@ This could be implemented as a higher-level Gumbel-Softmax over a small discrete
 
 ---
 
-## Phase 2.3: Experimental Validation of Full-Width Fix
+## Phase 2.3: Experimental Validation of Full-Width Fix — COMPLETE
+
+### Phase 2.3 Results (6-run screening, 540 steps each, 1× A100)
+
+| Run | Method | Init | tau | PPL 1/1 | PPL 1/2 | PPL 1/4 | PPL 1/8 | Layer fracs |
+|-----|--------|------|-----|---------|---------|---------|---------|-------------|
+| V1 | baseline | — | — | **141.6** | **147.2** | **153.0** | **159.6** | — |
+| V2 | topk | linspace(1.1) | 0.5 | 146.0 (+3.1%) | 151.9 (+3.2%) | 158.2 (+3.4%) | 165.2 (+3.5%) | 0.50 uniform |
+| V3 | gumbel_topk | linspace(1.1) | 0.5 | 147.1 (+3.9%) | 153.4 (+4.2%) | 159.8 (+4.4%) | 168.1 (+5.3%) | 0.50-0.51 |
+| G1 | gumbel_topk | zeros | 0.5 | 149.8 (+5.8%) | 157.9 (+7.3%) | 164.3 (+7.4%) | 168.9 (+5.8%) | 0.50-0.51 |
+| T1 | topk | zeros | 0.5 | 146.7 (+3.6%) | 156.6 (+6.4%) | 168.7 (+10.3%) | **236.0 (+47.9%)** | 0.50 uniform |
+| A3 | gumbel_topk | linspace(1.1) | 1.0 | 148.3 (+4.7%) | 154.8 (+5.2%) | 161.6 (+5.6%) | 172.2 (+7.9%) | 0.50-0.51 |
+
+### Phase 2.3 Analysis
+
+**Key findings:**
+
+1. **Baseline wins everywhere.** All mask methods add 3-8% PPL overhead at every sub-model width. The masks are a net negative — they consume training capacity without benefit.
+
+2. **Root cause: soft mask noise.** During training, each step does 4 forward-backward passes (factors 1, 2, 4, 8). At factors > 1, soft masks multiply activations by values in [0,1], injecting noise into representations. These noisy gradients from sub-model passes pollute the shared model weights. Baseline does the same 4 passes but with clean prefix slicing — no soft noise.
+
+3. **Masks barely learn.** Layer active fractions stayed at ~0.50 across all layers for all methods, meaning logits didn't move significantly from initialization. The gradient signal from the CE loss backpropagating through the soft mask is too weak for meaningful logit differentiation in 540 steps.
+
+4. **TopK can't break zero-init symmetry.** T1 (topk zeros) catastrophically failed at 1/8 (PPL 236 vs baseline 160). Without Gumbel noise, deterministic topk has no mechanism to break all-tied logits. Gumbel noise helps (G1: 169 at 1/8), confirming noise is essential for symmetry breaking.
+
+5. **Higher tau is worse.** A3 (tau=1.0) performed worse than V3 (tau=0.5) at all widths — more noise = more degradation.
+
+6. **Contrast with Phase 2 (prefix slicing).** Phase 2 at 540 steps beat baseline at sub-model widths: PPL 158.2 (1/2, -2.2%), 162.2 (1/4, -3.0%), 167.1 (1/8, -3.4%). The full-width approach is strictly worse. The prefix ordering in Phase 2 was actually a useful inductive bias, not a limitation — it constrained the mask to a smaller space where gradients were stronger.
+
+### Diagnosis: Why Masks Fail with Full-Width Compute
+
+The core problem is that soft masks with values near 0.5 effectively halve neuron activations at sub-model widths. With linspace(+1.1, -1.1), sigmoid range is [0.25, 0.75] — every neuron is in an ambiguous "maybe" zone. This means:
+- At factor=2 (k=1024): the top-k threshold selects ~1024 neurons, but their masks are soft (0.5-0.75), not crisp (near 1.0)
+- The bottom neurons also have non-negligible mask values (0.25-0.5), so they "leak" into the output
+- Gradients w.r.t. logits are weak because sigmoid'(x) is small when |x| is moderate
+
+**Three complementary fixes identified:**
+1. **Higher init scale** (e.g., 3.0 instead of 1.1) → sigmoid range [0.05, 0.95], neurons start clearly on/off
+2. **Spread aux loss** → gradient pressure on logits to separate, sharpening the top-k boundary
+3. **Tau → 0 at end** → masks become hard {0,1} at convergence, eliminating soft noise
+
+---
+
+## Phase 2.3b: Mask Sharpening Experiments
+
+### Motivation
+
+Phase 2.3 showed that soft masks inject noise that degrades training. The masks stayed at ~0.50 active fraction — logits didn't separate enough for crisp on/off decisions. Three complementary fixes address this from different angles.
+
+### Changes
+
+**1. Higher init scale (`init_scale=3.0`)**
+- Config-only change: `--hmat.gumbel_init_scale=3.0`
+- sigmoid(+3.0) = 0.95, sigmoid(-3.0) = 0.05 → neurons start clearly on or off
+- Much less soft noise from step 1; top-k threshold is sharp from the start
+
+**2. Spread aux loss (`spread_penalty_lambda`)**
+- New config field: `HMatConfig.spread_penalty_lambda: float = 0.0`
+- Loss: `-var(logits)` per layer, averaged across layers → maximizes logit separation
+- Applied to both gumbel and topk methods (skip during vanilla warmup)
+- Gradient pushes high logits higher and low logits lower, sharpening the top-k boundary
+
+**3. Hard freeze at end (`gumbel_freeze_fraction=0.2`)**
+- Existing config field, was set to 0.0
+- `gumbel_freeze_fraction=0.2` → last 20% of training uses hard {0,1} masks
+- Eliminates soft noise at convergence; final eval sees the actual discrete masks
+
+### Experiment Design (3 runs, 540 steps each, ~4.5 hours on 1 GPU)
+
+All three fixes applied simultaneously to the best method from Phase 2.3 (topk with linspace init, since it had the lowest PPL overhead). V1 baseline result (PPL 141.6 / 147.2 / 153.0 / 159.6) is reused as control.
+
+| Run | Method | Init scale | Spread λ | Freeze frac | tau | Rationale |
+|-----|--------|-----------|----------|-------------|-----|-----------|
+| S1 | topk | 3.0 | 0.01 | 0.2 | 0.5 | All three fixes combined |
+| S2 | gumbel_topk | 3.0 | 0.01 | 0.2 | 0.5 | Same fixes with Gumbel noise |
+| S3 | topk | 3.0 | 0.0 | 0.0 | 0.5 | Scale-only control (isolate scale effect) |
+
+**What this answers:**
+- Does higher init scale alone fix the soft noise problem? (S3 vs V2 from Phase 2.3)
+- Does the full fix package (scale + spread + freeze) close the gap to baseline? (S1 vs V1)
+- Does Gumbel noise help or hurt with sharp masks? (S1 vs S2)
+
+**Success criteria:** S1 or S2 should match or beat V1 baseline at sub-model widths (1/2, 1/4, 1/8) while staying within 2% at full width (1/1).
+
+---
+
+### Phase 2.3 Original Experimental Setup (archived)
 
 ### Experimental Setup
 
@@ -1834,3 +1920,137 @@ Analysis (Group 4) runs post-hoc on CPU using saved checkpoints.
 | 4 | Does Gumbel noise help top-k? | A1-A4 | Helps at unbiased init, neutral at linspace |
 | 5 | Does the fix eliminate long-run degradation? | L1-L3 | Full-model gap drops from +9% to <1% |
 | 6 | Do neurons genuinely reorder now? | Group 4 analysis | Significantly more reordering than Phase 2's 97-99% preservation |
+
+---
+
+## Phase 2.4: Scale-Up & Publication Experiments
+
+Phase 2.3 validates the full-width fix and method selection at the current tiny scale. This phase takes the winning configuration and scales it up to produce publishable results.
+
+**Prerequisite:** Critical checkpoint-restore bug fixes must land first (gumbel/topk state is saved but never loaded back; see `plan-critical-bugfixes.md`).
+
+### 2.4.1 Checkpoint Resume Validation
+
+Before any long run, confirm that checkpoint resume correctly preserves mask state.
+
+- Train 500 steps with best config, save checkpoint
+- Resume from checkpoint, train 500 more steps
+- Compare against uninterrupted 1000-step run
+- Assert: mask logits are identical at step 500, final PPL matches within noise
+
+### 2.4.2 Long Training on 17M Model
+
+Take the Phase 2.3 winner and train for 10K–50K steps on pile-700M.
+
+- **Goal:** Determine whether the Gumbel/TopK advantage grows, holds, or vanishes with longer training
+- Use `init_scale=1.1` (best from prior sweeps) as default
+- Log per-layer active fractions every 100 steps for allocation heatmaps
+
+### 2.4.3 Scale to 180M Model
+
+Same best config, 180M model (more layers → real "middle" for U-shape to appear).
+
+- **Goal:** Confirm U-shaped allocation is more pronounced with deeper models (4-layer model has no true intermediate layers)
+- Compare uniform MatFormer vs H-Mat at each sub-model width
+
+### 2.4.4 Downstream Task Evaluation
+
+Eval at multiple sub-model sizes ({1/1, 1/2, 1/4, 1/8}) using existing eval infrastructure:
+
+- PIQA, HellaSwag, WinoGrande, ARC-Easy, ARC-Challenge
+- Compare uniform MatFormer vs H-Mat at each size
+- Run on both 17M long-run and 180M checkpoints
+
+### 2.4.5 Pareto Frontier
+
+Plot accuracy (or PPL) vs FLOPs for uniform MatFormer and H-Mat across budgets {1/1, 1/2, 1/4, 1/8}. This is the key paper figure — H-Mat should show a strictly better frontier at compressed sizes.
+
+### 2.4.6 Allocation Visualization
+
+Using per-layer active fractions logged during training (2.4.2), produce a heatmap of layer × training step showing U-shape emergence over time.
+
+### 2.4.7 Reordering Sanity Check
+
+After training, run `scripts/reorder_neurons.py`, then eval the reordered checkpoint at each sub-model width. PPL should match the mask-based eval — if it doesn't, the reordering is lossy.
+
+---
+
+## Phase 2.0.2 Fix — Critical Bug Fixes and Performance Optimizations
+
+This phase addressed three critical bugs that blocked checkpoint resumption and two bugs affecting training correctness, plus three performance optimizations to reduce overhead in the Gumbel masking system. All changes were verified end-to-end on A100 GPU.
+
+### Bug Fix 1: Checkpoint Restore for Gumbel/TopK State (Critical)
+
+**Problem**: Gumbel and TopK mask state (learned logits + optimizer momentum) was saved to both sharded and unsharded checkpoints, but never loaded back. Any training run resumed from a checkpoint silently reinitialized masks from scratch, destroying all learned allocation patterns.
+
+**Root cause**: `init_gumbel()` and `init_topk()` were called inside `fit()`, which runs *after* `restore_checkpoint()` in `scripts/train.py`. Even if restore loaded the state, `init_gumbel()` would overwrite it with fresh defaults.
+
+**Fix** (4 parts):
+
+| Change | File | Description |
+|--------|------|-------------|
+| `init_masks()` method | `olmo/train.py` | New wrapper calling `init_gumbel()` + `init_topk()`, called before checkpoint restore |
+| Early init in entry point | `scripts/train.py` | `trainer.init_masks()` called immediately after Trainer creation, before any checkpoint ops |
+| Guarded init in `fit()` | `olmo/train.py` | Changed from unconditional to `if self.gumbel_manager is None: self.init_gumbel()` |
+| Sharded restore | `olmo/train.py` | Loads `gumbel_manager`, `gumbel_optim`, `topk_manager`, `topk_optim` from `state_dict` if present |
+| Unsharded restore | `olmo/train.py` | Loads `gumbel.pt`, `gumbel_optim.pt`, `topk.pt`, `topk_optim.pt` with `FileNotFoundError` fallback for older checkpoints |
+| Remote upload | `olmo/train.py` | Extended unsharded upload loop to include gumbel/topk files with `exists()` guard |
+
+**Verification**: `scripts/test_checkpoint_restore.py` — trains 10 steps, saves checkpoint, restores into fresh Trainer, asserts logits match pre-save values and differ from fresh init. Tested for both `gumbel` and `topk` methods on A100.
+
+### Bug Fix 2: Gumbel Freeze Destroys Optimizer State
+
+**Problem**: When the freeze phase activated (last X% of training), the code set `self.gumbel_optim = None`, destroying the optimizer and its momentum buffers. Any checkpoint saved after freeze had no gumbel optimizer state, breaking resumption.
+
+**Fix**: Added `_gumbel_frozen: bool = False` to the Trainer dataclass. Replaced `self.gumbel_optim = None` with `self._gumbel_frozen = True`. Gated `zero_grad()` and `optim.step()` on the flag instead of a None check. The optimizer stays alive for checkpointing while updates are stopped.
+
+**Verification**: `scripts/test_freeze_warmup.py` — trains with `gumbel_freeze_fraction=0.4`, verifies `gumbel_optim is not None` after freeze, `_gumbel_frozen == True`, `gumbel_optim.pt` saved with populated state, and state survives a checkpoint round-trip.
+
+### Bug Fix 3: `_in_vanilla_warmup` Not a Dataclass Field
+
+**Problem**: `_in_vanilla_warmup` was accessed via `getattr(self, '_in_vanilla_warmup', False)`, relying on it being set dynamically during `train_step`. If accessed before the first step (e.g., during checkpoint restore), it would silently fall back to `False` with no indication of the fragile pattern.
+
+**Fix**: Added `_in_vanilla_warmup: bool = False` as a proper Trainer dataclass field. Replaced all `getattr` calls with direct `self._in_vanilla_warmup` access.
+
+**Verification**: Same `test_freeze_warmup.py` — confirms `hasattr(trainer, '_in_vanilla_warmup')` is True immediately after construction, MatformerManager mode is `"uniform"` during warmup, and logits change after warmup ends.
+
+### Optimization 1: Cast Gumbel Masks to bf16 Before Multiplication
+
+**Problem**: Gumbel masks are float32. Under AMP, hidden states `h` are bf16. Multiplying `h * mask` promoted to float32, creating unnecessary precision bounce.
+
+**Fix** (`olmo/model.py`, 3 sites): Added `.to(dtype=h.dtype)` before `unsqueeze` in all mask application lines. No-op when already matching dtype.
+
+**Verification**: Confirmed result stays bf16 (was being promoted to f32). Numerically equivalent within bf16 tolerance.
+
+### Optimization 2: Vectorize Budget Loss Computation
+
+**Problem**: `budget_loss()` looped over `self.masks` accumulating `sigmoid().sum()` per layer — N intermediate scalar tensors and Python loop overhead.
+
+**Fix** (`olmo/hmat/gumbel.py`): Replaced with `torch.cat([m.logits for m in self.masks])` → `sigmoid` → `mean` — single fused operation.
+
+**Verification**: Exact match (diff=0.00e+00) with old loop version at targets {0.1, 0.3, 0.5, 0.7, 0.9}. Gradients flow correctly.
+
+### Optimization 3: Cache Sliced Weight Views Per Factor
+
+**Problem**: Every forward pass through `OlmoSequentialBlock` when `factor > 1` recomputed `weight[:k]` slice views and `int(n / factor)`. While views are cheap, this happens for every micro-batch at every sub-model width.
+
+**Fix** (`olmo/model.py`): Added `_get_ff_params(factor)` method that caches `(w_proj, b_proj, k_out, w_out, b_out)` and invalidates when factor changes. FSDP safety: cache invalidated when `_full_param_padded` attribute is detected on weights (indicates resharding).
+
+**Verification**: Repeated forwards at same factor produce bit-identical output. Different factors produce different output. `_cached_factor` correctly tracks state. End-to-end 10-step training with all optimizations active produces no NaNs.
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `olmo/train.py` | `init_masks()`, guarded `fit()`, restore gumbel/topk in both checkpoint paths, `_gumbel_frozen` flag, `_in_vanilla_warmup` field, remote upload for mask files |
+| `scripts/train.py` | `trainer.init_masks()` before checkpoint restore |
+| `olmo/model.py` | `.to(dtype=h.dtype)` on 3 mask sites, `_get_ff_params()` weight view cache with FSDP invalidation |
+| `olmo/hmat/gumbel.py` | Vectorized `budget_loss()` |
+
+### Test Scripts Added
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/test_checkpoint_restore.py` | Gumbel + TopK checkpoint save/restore round-trip (A100) |
+| `scripts/test_freeze_warmup.py` | Vanilla warmup + freeze flag + post-freeze checkpoint (A100) |
+| `scripts/test_optimizations.py` | bf16 cast, vectorized budget loss, weight view cache, e2e training (A100) |

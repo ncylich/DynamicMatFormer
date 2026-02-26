@@ -51,7 +51,9 @@ def compute_fisher_saliency(
         param.requires_grad_(True)
 
     n_layers = len(model.transformer.blocks)
-    mlp_dim = model.transformer.blocks[0].ff_proj.weight.shape[0]
+    # Use ff_out columns as the saliency dimension — this is the post-activation
+    # hidden size and is correct for both standard (mlp_dim) and SwiGLU (mlp_dim/2).
+    mlp_dim = model.transformer.blocks[0].ff_out.weight.shape[1]
 
     saliency = {l: torch.zeros(mlp_dim, device=device) for l in range(n_layers)}
 
@@ -81,13 +83,17 @@ def compute_fisher_saliency(
 
         # Accumulate per-dimension saliency
         for l, block in enumerate(model.transformer.blocks):
-            # ff_proj.weight: (mlp_dim, d_model) — row d is dimension d's input weights
+            # ff_proj.weight: (ff_proj_dim, d_model) — for SwiGLU ff_proj_dim = 2*mlp_dim
             grad_proj = block.ff_proj.weight.grad
             # ff_out.weight: (d_model, mlp_dim) — column d is dimension d's output weights
             grad_out = block.ff_out.weight.grad
 
             if grad_proj is not None and grad_out is not None:
-                saliency[l] += (grad_proj ** 2).sum(dim=1) + (grad_out ** 2).sum(dim=0)
+                proj_saliency = (grad_proj ** 2).sum(dim=1)  # (ff_proj_dim,)
+                # For SwiGLU: ff_proj_dim = 2*mlp_dim; sum gate + value contributions per dim.
+                if proj_saliency.shape[0] != mlp_dim:
+                    proj_saliency = proj_saliency.view(-1, mlp_dim).sum(dim=0)
+                saliency[l] += proj_saliency + (grad_out ** 2).sum(dim=0)
 
         batches_processed += 1
 

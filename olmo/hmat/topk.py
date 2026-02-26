@@ -25,11 +25,19 @@ class TopKMaskLayer(nn.Module):
     are active at convergence.
     """
 
-    def __init__(self, mlp_dim: int, init_scale: float = 1.1):
+    def __init__(self, mlp_dim: int, init_scale: float = 1.1, init_mode: str = "linspace", init_value: float = 1.5):
         super().__init__()
         self.mlp_dim = mlp_dim
-        # Same linear decay init as Phase 2 — first dims important, last dims not
-        self.logits = nn.Parameter(torch.linspace(init_scale, -init_scale, mlp_dim))
+        # Build initial logit vector based on init_mode
+        if init_mode == "zeros":
+            init_logits = torch.zeros(mlp_dim)
+        elif init_mode == "normal":
+            init_logits = torch.randn(mlp_dim) * init_value
+        elif init_mode == "constant":
+            init_logits = torch.full((mlp_dim,), init_value)
+        else:  # "linspace" (default)
+            init_logits = torch.linspace(init_scale, -init_scale, mlp_dim)
+        self.logits = nn.Parameter(init_logits)
 
     def forward(self, k: int, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
         """
@@ -72,12 +80,15 @@ class TopKMaskLayer(nn.Module):
 class TopKMaskManager(nn.Module):
     """Manages top-k masks for all layers in the model."""
 
-    def __init__(self, n_layers: int, mlp_dim: int, init_scale: float = 1.1):
+    def __init__(
+        self, n_layers: int, mlp_dim: int, init_scale: float = 1.1,
+        init_mode: str = "linspace", init_value: float = 1.5,
+    ):
         super().__init__()
         self.n_layers = n_layers
         self.mlp_dim = mlp_dim
         self.masks = nn.ModuleList([
-            TopKMaskLayer(mlp_dim, init_scale=init_scale)
+            TopKMaskLayer(mlp_dim, init_scale=init_scale, init_mode=init_mode, init_value=init_value)
             for _ in range(n_layers)
         ])
 
@@ -85,6 +96,17 @@ class TopKMaskManager(nn.Module):
                  hard: bool = False) -> torch.Tensor:
         """Get the mask for a specific layer at a specific sub-model width."""
         return self.masks[layer_idx](k=k, tau=tau, hard=hard)
+
+    def spread_loss(self) -> torch.Tensor:
+        """
+        Spread penalty: maximize logit variance to sharpen mask boundaries.
+
+        Returns negative mean per-layer variance (minimize this to maximize spread).
+        """
+        total = torch.tensor(0.0, device=self.masks[0].logits.device)
+        for m in self.masks:
+            total = total - torch.var(m.logits)
+        return total / self.n_layers
 
     def get_layer_widths(self, k: int) -> Dict[int, int]:
         """For a given target k, return actual active dim count per layer."""

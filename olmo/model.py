@@ -420,6 +420,21 @@ class OlmoSequentialBlock(OlmoBlock):
             config.d_model, config.mlp_ratio * config.d_model, bias=config.include_bias, device=config.init_device
         )
 
+    def _get_ff_params(self, factor: int):
+        """Return (w_proj, b_proj, k_out, w_out, b_out) for given factor, caching views."""
+        if getattr(self, '_cached_factor', None) != factor:
+            n = self.ff_proj.weight.shape[0]
+            k = n // factor
+            k_out = int(k * self.act.output_multiplier)
+            self._cached_factor = factor
+            self._cached_w_proj = self.ff_proj.weight[:k]
+            self._cached_b_proj = self.ff_proj.bias[:k]
+            self._cached_k_out = k_out
+            self._cached_w_out = self.ff_out.weight[:, :k_out]
+            self._cached_b_out = self.ff_out.bias
+        return (self._cached_w_proj, self._cached_b_proj,
+                self._cached_k_out, self._cached_w_out, self._cached_b_out)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -448,19 +463,16 @@ class OlmoSequentialBlock(OlmoBlock):
         use_gumbel_topk = self.matmng.mode == "gumbel_topk" and self.matmng.gumbel_masks is not None
         use_topk = self.matmng.mode == "topk" and self.matmng.topk_masks is not None
 
+        # Invalidate weight view cache if FSDP may have resharded parameters.
+        if hasattr(self.ff_proj.weight, '_full_param_padded'):
+            self._cached_factor = None
+
         if factor == 1:
             h = self.act(self.ff_proj(self.ff_norm(x)))
             # At factor=1 (full model): no mask applied — preserves full capacity.
             x = x + self.dropout(self.ff_out(h))
         else:
-            n = self.ff_proj.weight.shape[0]
-            k = int(n / factor)
-            w_proj = self.ff_proj.weight[:k]
-            b_proj = self.ff_proj.bias[:k]
-            # Account for activation output multiplier (e.g. SwiGLU halves the dim)
-            k_out = int(k * self.act.output_multiplier)
-            w_out = self.ff_out.weight[:, :k_out]
-            b_out = self.ff_out.bias
+            w_proj, b_proj, k_out, w_out, b_out = self._get_ff_params(factor)
 
             h = self.act(F.linear(self.ff_norm(x), w_proj, b_proj))
             if use_gumbel:
@@ -469,20 +481,20 @@ class OlmoSequentialBlock(OlmoBlock):
                 mask = self.matmng.gumbel_masks.get_mask(
                     self.layer_idx, tau=tau, hard=not self.training
                 )
-                h = h * mask[:k_out].unsqueeze(0).unsqueeze(0)
+                h = h * mask[:k_out].to(dtype=h.dtype).unsqueeze(0).unsqueeze(0)
             if use_gumbel_topk:
                 tau = self.matmng.gumbel_tau
                 # Gumbel-Top-K: k=k_out → top-k threshold on noisy logits
                 mask = self.matmng.gumbel_masks.get_mask(
                     self.layer_idx, k=k_out, tau=tau, hard=not self.training
                 )
-                h = h * mask[:k_out].unsqueeze(0).unsqueeze(0)
+                h = h * mask[:k_out].to(dtype=h.dtype).unsqueeze(0).unsqueeze(0)
             if use_topk:
                 tau = self.matmng.gumbel_tau  # Reuse tau infrastructure
                 topk_mask = self.matmng.topk_masks.get_mask(
                     self.layer_idx, k=k_out, tau=tau, hard=not self.training
                 )
-                h = h * topk_mask[:k_out].unsqueeze(0).unsqueeze(0)
+                h = h * topk_mask[:k_out].to(dtype=h.dtype).unsqueeze(0).unsqueeze(0)
             x = x + self.dropout(F.linear(h, w_out, b_out))
 
         return x, cache

@@ -17,12 +17,25 @@ import torch.nn as nn
 class GumbelMaskLayer(nn.Module):
     """Per-layer learnable importance gate using Gumbel-Sigmoid."""
 
-    def __init__(self, mlp_dim: int, init_scale: float = 2.2, learnable: bool = True):
+    def __init__(
+        self,
+        mlp_dim: int,
+        init_scale: float = 2.2,
+        learnable: bool = True,
+        init_mode: str = "linspace",
+        init_value: float = 1.5,
+    ):
         super().__init__()
         self.mlp_dim = mlp_dim
-        # Linear decay: first dims get positive logits (always on),
-        # last dims get negative logits (usually off).
-        init_logits = torch.linspace(init_scale, -init_scale, mlp_dim)
+        # Build initial logit vector based on init_mode
+        if init_mode == "zeros":
+            init_logits = torch.zeros(mlp_dim)
+        elif init_mode == "normal":
+            init_logits = torch.randn(mlp_dim) * init_value
+        elif init_mode == "constant":
+            init_logits = torch.full((mlp_dim,), init_value)
+        else:  # "linspace" (default)
+            init_logits = torch.linspace(init_scale, -init_scale, mlp_dim)
         if learnable:
             self.logits = nn.Parameter(init_logits)
         else:
@@ -89,12 +102,23 @@ class GumbelMaskLayer(nn.Module):
 class GumbelMaskManager(nn.Module):
     """Manages Gumbel masks for all layers in the model."""
 
-    def __init__(self, n_layers: int, mlp_dim: int, init_scale: float = 2.2, learnable: bool = True):
+    def __init__(
+        self,
+        n_layers: int,
+        mlp_dim: int,
+        init_scale: float = 2.2,
+        learnable: bool = True,
+        init_mode: str = "linspace",
+        init_value: float = 1.5,
+    ):
         super().__init__()
         self.n_layers = n_layers
         self.mlp_dim = mlp_dim
         self.masks = nn.ModuleList([
-            GumbelMaskLayer(mlp_dim, init_scale=init_scale, learnable=learnable)
+            GumbelMaskLayer(
+                mlp_dim, init_scale=init_scale, learnable=learnable,
+                init_mode=init_mode, init_value=init_value,
+            )
             for _ in range(n_layers)
         ])
 
@@ -102,6 +126,17 @@ class GumbelMaskManager(nn.Module):
                  k: Optional[int] = None) -> torch.Tensor:
         """Get the mask for a specific layer at a given sub-model width."""
         return self.masks[layer_idx](tau=tau, hard=hard, k=k)
+
+    def spread_loss(self) -> torch.Tensor:
+        """
+        Spread penalty: maximize logit variance to sharpen mask boundaries.
+
+        Returns negative mean per-layer variance (minimize this to maximize spread).
+        """
+        total = torch.tensor(0.0, device=self.masks[0].logits.device)
+        for m in self.masks:
+            total = total - torch.var(m.logits)
+        return total / self.n_layers
 
     def budget_loss(self, target: float) -> torch.Tensor:
         """
@@ -113,10 +148,8 @@ class GumbelMaskManager(nn.Module):
         Returns:
             Scalar penalty |mean_active_fraction - target|.
         """
-        total_active = torch.tensor(0.0, device=self.masks[0].logits.device)
-        for mask_layer in self.masks:
-            total_active = total_active + torch.sigmoid(mask_layer.logits).sum()
-        mean_fraction = total_active / (self.n_layers * self.mlp_dim)
+        all_logits = torch.cat([m.logits for m in self.masks])
+        mean_fraction = torch.sigmoid(all_logits).mean()
         return torch.abs(mean_fraction - target)
 
     def get_layer_widths(self) -> Dict[int, int]:

@@ -653,6 +653,12 @@ class Trainer:
                     budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
                     loss = loss + self.cfg.hmat.budget_penalty_lambda * budget_penalty / len(micro_batches)
 
+                # Add spread penalty to sharpen mask boundaries (skip during vanilla warmup).
+                if self.cfg.hmat.enabled and self.cfg.hmat.spread_penalty_lambda > 0 and not self._in_vanilla_warmup:
+                    mask_mgr = self.gumbel_manager or self.topk_manager
+                    if mask_mgr is not None:
+                        loss = loss + self.cfg.hmat.spread_penalty_lambda * mask_mgr.spread_loss() / len(micro_batches)
+
                 del logits
 
             # Check for nan.
@@ -748,6 +754,7 @@ class Trainer:
             for i in range(iters):
                 # Reduce loss metrics across ranks.
                 ce_batch_loss, z_batch_loss = self.train_batch(batch)
+                self.ce_train_loss_metric.reset()
                 self.ce_train_loss_metric.update(ce_batch_loss)
                 ce_batch_loss = self.ce_train_loss_metric.compute()
                 losses.append((ce_batch_loss, z_batch_loss))
@@ -821,7 +828,7 @@ class Trainer:
             for i in range(len(losses)):
                 factor = 2**i
                 metrics[f'train/CrossEntropyLoss 1/{factor}'] = losses[i][0].item()
-                metrics[f'train/Perplexity 1/{factor}'] = (2**(losses[i][0])).item()
+                metrics[f'train/Perplexity 1/{factor}'] = torch.exp(losses[i][0]).item()
                 if z_batch_loss is not None and self.z_train_loss_metric is not None:
                     self.z_train_loss_metric.update(z_batch_loss)
                     z_batch_loss = self.z_train_loss_metric.compute()
@@ -848,6 +855,8 @@ class Trainer:
                 budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
                 metrics["gumbel/budget_penalty"] = budget_penalty.item()
             # gumbel_topk: no budget penalty — sparsity is structural via top-k
+            if self.cfg.hmat.spread_penalty_lambda > 0:
+                metrics["gumbel/spread_loss"] = self.gumbel_manager.spread_loss().item()
 
         # Log TopK metrics.
         if self.topk_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "topk":
@@ -859,6 +868,8 @@ class Trainer:
             metrics.update(self.topk_manager.log_summary(k=k_half))
             matmng = MatformerManager.get_instance()
             metrics["topk/tau"] = matmng.gumbel_tau
+            if self.cfg.hmat.spread_penalty_lambda > 0:
+                metrics["topk/spread_loss"] = self.topk_manager.spread_loss().item()
 
         # Update min train loss and see if we should stop early.
         self.min_train_loss = min(self.min_train_loss, ce_batch_loss.item())  # type: ignore
@@ -991,13 +1002,13 @@ class Trainer:
                         if eval_step + 1 == num_eval_batches or (eval_step + 1) % self.cfg.console_log_interval == 0:
                             log.info(f"[eval_step={eval_step + 1}/{num_eval_batches}]")
 
-                    # Get final metrics.
+                    # Get final metrics, keyed by factor to avoid overwrites.
                     metrics = evaluator.compute_metrics()
-                    eval_metrics.update(metrics)
-                    self.log_metrics_to_console(f"{evaluator.label} 1/{self.matmng.current_factor}", metrics)
+                    factor = self.matmng.current_factor
+                    self.log_metrics_to_console(f"{evaluator.label} 1/{factor}", metrics)
+                    for k, v in metrics.items():
+                        eval_metrics[f"{k} 1/{factor}"] = v
                     self.matmng.current_factor *= 2
-                    for m in metrics:
-                        eval_metrics.pop(m, None)
             else:
                 # Reset metrics.
                 evaluator.reset_metrics()
@@ -1046,6 +1057,8 @@ class Trainer:
             mlp_dim=mlp_dim,
             init_scale=self.cfg.hmat.gumbel_init_scale,
             learnable=not is_fisher,  # Fisher-guided: logits are buffers, not parameters
+            init_mode=self.cfg.hmat.gumbel_init_mode,
+            init_value=self.cfg.hmat.gumbel_init_value,
         ).to(self.device)
 
         matmng = MatformerManager.get_instance()
@@ -1114,6 +1127,8 @@ class Trainer:
             n_layers=self.cfg.model.n_layers,
             mlp_dim=mlp_dim,
             init_scale=self.cfg.hmat.gumbel_init_scale,
+            init_mode=self.cfg.hmat.gumbel_init_mode,
+            init_value=self.cfg.hmat.gumbel_init_value,
         ).to(self.device)
 
         # Separate optimizer for topk logits (same pattern as Phase 2 gumbel)
