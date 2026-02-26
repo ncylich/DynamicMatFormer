@@ -111,6 +111,8 @@ class Trainer:
     topk_manager: Optional[TopKMaskManager] = None
     topk_optim: Optional[torch.optim.Optimizer] = None
     fisher_ema: Optional[FisherEMA] = None
+    _gumbel_frozen: bool = False
+    _in_vanilla_warmup: bool = False
     global_step: int = 0
     global_data_step: int = 0
     """This is now redundant since adding 'global_train_examples_seen'."""
@@ -361,6 +363,22 @@ class Trainer:
             # Load non-tensor state.
             self.load_non_tensor_state_dict(state_dict)
 
+            # Load gumbel mask state if present in checkpoint and manager exists.
+            if "gumbel_manager" in state_dict and self.gumbel_manager is not None:
+                log.info("Loading gumbel mask state...")
+                self.gumbel_manager.load_state_dict(state_dict["gumbel_manager"])
+            if "gumbel_optim" in state_dict and self.gumbel_optim is not None:
+                log.info("Loading gumbel optimizer state...")
+                self.gumbel_optim.load_state_dict(state_dict["gumbel_optim"])
+
+            # Load topk mask state if present in checkpoint and manager exists.
+            if "topk_manager" in state_dict and self.topk_manager is not None:
+                log.info("Loading topk mask state...")
+                self.topk_manager.load_state_dict(state_dict["topk_manager"])
+            if "topk_optim" in state_dict and self.topk_optim is not None:
+                log.info("Loading topk optimizer state...")
+                self.topk_optim.load_state_dict(state_dict["topk_optim"])
+
             del state_dict, flattened_osd
 
         barrier()
@@ -456,11 +474,13 @@ class Trainer:
         # Upload checkpoint to bucket.
         if self.cfg.remote_save_folder is not None:
             if get_global_rank() == 0:
-                for fname in ["config.yaml", "model.pt", "optim.pt", "other.pt"]:
+                for fname in ["config.yaml", "model.pt", "optim.pt", "other.pt",
+                              "gumbel.pt", "gumbel_optim.pt", "topk.pt", "topk_optim.pt"]:
                     source = checkpoint_dir / fname
-                    target = f"{self.cfg.remote_save_folder}/{checkpoint_dir.name}/{fname}"
-                    log.info(f"Uploading {source} to {target}...")
-                    upload(source, target, save_overwrite=self.cfg.save_overwrite)
+                    if source.exists():  # gumbel/topk files may not exist
+                        target = f"{self.cfg.remote_save_folder}/{checkpoint_dir.name}/{fname}"
+                        log.info(f"Uploading {source} to {target}...")
+                        upload(source, target, save_overwrite=self.cfg.save_overwrite)
             barrier()
 
         return checkpoint_dir
@@ -506,6 +526,38 @@ class Trainer:
             # Load other state.
             other_state_dict = torch.load(resource_path(load_path, "other.pt"), weights_only=False)
             self.load_non_tensor_state_dict(other_state_dict)
+
+        # Load gumbel mask state if checkpoint contains it.
+        if self.gumbel_manager is not None:
+            try:
+                gumbel_state = torch.load(resource_path(load_path, "gumbel.pt"), weights_only=False)
+                self.gumbel_manager.load_state_dict(gumbel_state)
+                log.info("Loaded gumbel mask state from checkpoint.")
+            except FileNotFoundError:
+                log.info("No gumbel.pt in checkpoint, using fresh initialization.")
+        if self.gumbel_optim is not None:
+            try:
+                gumbel_optim_state = torch.load(resource_path(load_path, "gumbel_optim.pt"), weights_only=False)
+                self.gumbel_optim.load_state_dict(gumbel_optim_state)
+                log.info("Loaded gumbel optimizer state from checkpoint.")
+            except FileNotFoundError:
+                log.info("No gumbel_optim.pt in checkpoint, using fresh optimizer.")
+
+        # Load topk mask state if checkpoint contains it.
+        if self.topk_manager is not None:
+            try:
+                topk_state = torch.load(resource_path(load_path, "topk.pt"), weights_only=False)
+                self.topk_manager.load_state_dict(topk_state)
+                log.info("Loaded topk mask state from checkpoint.")
+            except FileNotFoundError:
+                log.info("No topk.pt in checkpoint, using fresh initialization.")
+        if self.topk_optim is not None:
+            try:
+                topk_optim_state = torch.load(resource_path(load_path, "topk_optim.pt"), weights_only=False)
+                self.topk_optim.load_state_dict(topk_optim_state)
+                log.info("Loaded topk optimizer state from checkpoint.")
+            except FileNotFoundError:
+                log.info("No topk_optim.pt in checkpoint, using fresh optimizer.")
 
         barrier()
 
@@ -597,7 +649,7 @@ class Trainer:
                     loss = ce_loss
 
                 # Add Gumbel budget penalty (skip during vanilla warmup).
-                if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel" and not getattr(self, '_in_vanilla_warmup', False):
+                if self.gumbel_manager is not None and self.cfg.hmat.enabled and self.cfg.hmat.method == "gumbel" and not self._in_vanilla_warmup:
                     budget_penalty = self.gumbel_manager.budget_loss(self.cfg.hmat.budget_penalty_target)
                     loss = loss + self.cfg.hmat.budget_penalty_lambda * budget_penalty / len(micro_batches)
 
@@ -632,7 +684,7 @@ class Trainer:
 
         # Zero-gradients.
         self.optim.zero_grad(set_to_none=True)
-        if self.gumbel_optim is not None:
+        if self.gumbel_optim is not None and not self._gumbel_frozen:
             self.gumbel_optim.zero_grad(set_to_none=True)
         if self.topk_optim is not None:
             self.topk_optim.zero_grad(set_to_none=True)
@@ -656,8 +708,7 @@ class Trainer:
             if frozen:
                 # Freeze: stop gumbel optimizer, force hard masks via very low tau
                 matmng.gumbel_tau = 0.001
-                if self.gumbel_optim is not None:
-                    self.gumbel_optim = None  # Stop updating mask logits
+                self._gumbel_frozen = True
             else:
                 # Compress tau schedule to complete BEFORE freeze point
                 anneal_steps = self.cfg.hmat.gumbel_tau_anneal_steps or self.cfg.max_duration
@@ -760,7 +811,7 @@ class Trainer:
         # Optimizer step.
         self.optim.step()
         self.scheduler.step()
-        if self.gumbel_optim is not None and not self._in_vanilla_warmup:
+        if self.gumbel_optim is not None and not self._in_vanilla_warmup and not self._gumbel_frozen:
             self.gumbel_optim.step()
         if self.topk_optim is not None and not self._in_vanilla_warmup:
             self.topk_optim.step()
@@ -1045,6 +1096,11 @@ class Trainer:
                     f"lambda={self.cfg.hmat.budget_penalty_lambda}"
                 )
 
+    def init_masks(self):
+        """Initialize mask managers (gumbel/topk) if configured. Must be called before restore_checkpoint."""
+        self.init_gumbel()
+        self.init_topk()
+
     def init_topk(self):
         """Initialize TopK mask manager if configured."""
         if not self.cfg.hmat.enabled or self.cfg.hmat.method != "topk":
@@ -1090,11 +1146,11 @@ class Trainer:
     def fit(self):
         start_time = time.time()
 
-        # Initialize Gumbel masks if configured.
-        self.init_gumbel()
-
-        # Initialize TopK masks if configured.
-        self.init_topk()
+        # Ensure masks are initialized (no-op if already done via init_masks()).
+        if self.gumbel_manager is None:
+            self.init_gumbel()
+        if self.topk_manager is None:
+            self.init_topk()
 
         if self.cfg.load_path is not None and self.global_step > 0 and self.cfg.eval_on_load:
             eval_metrics = self.eval()

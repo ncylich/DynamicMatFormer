@@ -169,6 +169,9 @@ def main(cfg: TrainConfig) -> None:
         evaluators=evaluators,
         indices_file=indices_file,
     ) as trainer:
+        # Initialize mask managers BEFORE checkpoint restore so state can be loaded.
+        trainer.init_masks()
+
         if not cfg.dry_run and cfg.load_path is None:
             checkpoint_type = (
                 CheckpointType.sharded if cfg.save_num_checkpoints_to_keep != 0 else CheckpointType.unsharded
