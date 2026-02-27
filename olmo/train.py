@@ -113,6 +113,7 @@ class Trainer:
     fisher_ema: Optional[FisherEMA] = None
     _gumbel_frozen: bool = False
     _in_vanilla_warmup: bool = False
+    _topk_restored: bool = False
     global_step: int = 0
     global_data_step: int = 0
     """This is now redundant since adding 'global_train_examples_seen'."""
@@ -380,6 +381,7 @@ class Trainer:
             if "topk_manager" in state_dict and self.topk_manager is not None:
                 log.info("Loading topk mask state...")
                 self.topk_manager.load_state_dict(state_dict["topk_manager"])
+                self._topk_restored = True
             if "topk_optim" in state_dict and self.topk_optim is not None:
                 log.info("Loading topk optimizer state...")
                 self.topk_optim.load_state_dict(state_dict["topk_optim"])
@@ -459,6 +461,12 @@ class Trainer:
                     torch.save(self.topk_manager.state_dict(), checkpoint_dir_tmp / "topk.pt")
                 if self.topk_optim is not None:
                     torch.save(self.topk_optim.state_dict(), checkpoint_dir_tmp / "topk_optim.pt")
+                # Save Fisher EMA state if present.
+                if self.fisher_ema is not None:
+                    torch.save({
+                        "scores": [s.cpu() for s in self.fisher_ema.scores],
+                        "steps": self.fisher_ema.steps,
+                    }, checkpoint_dir_tmp / "fisher_ema.pt")
             barrier()
 
         if get_global_rank() == 0:
@@ -487,7 +495,8 @@ class Trainer:
         if self.cfg.remote_save_folder is not None:
             if get_global_rank() == 0:
                 for fname in ["config.yaml", "model.pt", "optim.pt", "other.pt",
-                              "gumbel.pt", "gumbel_optim.pt", "topk.pt", "topk_optim.pt"]:
+                              "gumbel.pt", "gumbel_optim.pt", "topk.pt", "topk_optim.pt",
+                              "fisher_ema.pt"]:
                     source = checkpoint_dir / fname
                     if source.exists():  # gumbel/topk files may not exist
                         target = f"{self.cfg.remote_save_folder}/{checkpoint_dir.name}/{fname}"
@@ -560,6 +569,7 @@ class Trainer:
             try:
                 topk_state = torch.load(resource_path(load_path, "topk.pt"), weights_only=False)
                 self.topk_manager.load_state_dict(topk_state)
+                self._topk_restored = True
                 log.info("Loaded topk mask state from checkpoint.")
             except FileNotFoundError:
                 log.info("No topk.pt in checkpoint, using fresh initialization.")
@@ -570,6 +580,16 @@ class Trainer:
                 log.info("Loaded topk optimizer state from checkpoint.")
             except FileNotFoundError:
                 log.info("No topk_optim.pt in checkpoint, using fresh optimizer.")
+
+        # Load Fisher EMA state if checkpoint contains it.
+        if self.fisher_ema is not None:
+            try:
+                fisher_state = torch.load(resource_path(load_path, "fisher_ema.pt"), weights_only=False)
+                self.fisher_ema.scores = [s.to(self.device) for s in fisher_state["scores"]]
+                self.fisher_ema.steps = fisher_state["steps"]
+                log.info(f"Loaded Fisher EMA state from checkpoint ({fisher_state['steps']} steps).")
+            except FileNotFoundError:
+                log.info("No fisher_ema.pt in checkpoint, using fresh Fisher EMA.")
 
         barrier()
 
@@ -693,7 +713,12 @@ class Trainer:
             self.indices_file.write(f"{self.global_step}\t{indices}\n")
 
         # === Vanilla warmup: train with full (uniform) model before enabling masks ===
-        vanilla_warmup_steps = int(self.cfg.hmat.vanilla_warmup_frac * self.cfg.max_duration) if self.cfg.hmat.enabled else 0
+        # Use vanilla_warmup_frac; fall back to fisher_warmup_frac for fisher_gumbel legacy configs.
+        if self.cfg.hmat.enabled:
+            warmup_frac = self.cfg.hmat.vanilla_warmup_frac if self.cfg.hmat.vanilla_warmup_frac > 0 else self.cfg.hmat.fisher_warmup_frac
+            vanilla_warmup_steps = int(warmup_frac * self.cfg.max_duration)
+        else:
+            vanilla_warmup_steps = 0
         self._in_vanilla_warmup = vanilla_warmup_steps > 0 and self.global_step <= vanilla_warmup_steps
 
         # Activate mask mode when warmup ends
@@ -704,8 +729,10 @@ class Trainer:
                 matmng.mode = target
                 log.info(f"Vanilla warmup complete at step {self.global_step}, enabling {target} masks")
 
-                # Fisher-informed init: re-init topk logits from Fisher rankings at transition
+                # Fisher-informed init: re-init topk logits from Fisher rankings at transition.
+                # Skip if topk state was already restored from a checkpoint.
                 if (self.cfg.hmat.fisher_init and self.topk_manager is not None
+                        and not self._topk_restored
                         and self.fisher_ema is not None and self.fisher_ema.steps > 0):
                     fisher_logits = self.fisher_ema.get_logits(
                         scale=self.cfg.hmat.gumbel_init_scale, mode="rank")
