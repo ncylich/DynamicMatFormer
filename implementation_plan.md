@@ -1772,6 +1772,26 @@ All three fixes applied simultaneously to the best method from Phase 2.3 (topk w
 
 **Success criteria:** S1 or S2 should match or beat V1 baseline at sub-model widths (1/2, 1/4, 1/8) while staying within 2% at full width (1/1).
 
+### Phase 2.3b Results
+
+| Run | Config | PPL 1/1 | PPL 1/2 | PPL 1/4 | PPL 1/8 |
+|-----|--------|---------|---------|---------|---------|
+| V1 | baseline (no masks) | 141.6 | 147.2 | 153.0 | 159.6 |
+| V2 | topk scale=1.1 (Phase 2.3) | 146.0 (+3.1%) | 151.9 (+3.2%) | 158.2 (+3.4%) | 165.2 (+3.5%) |
+| **S3** | **topk scale=3.0 only** | **141.0 (-0.4%)** | **146.3 (-0.6%)** | **152.1 (-0.6%)** | **159.0 (-0.4%)** |
+| **S1** | **topk scale=3.0 + spread(0.01) + freeze(0.2)** | **140.3 (-0.9%)** | **145.6 (-1.1%)** | **151.2 (-1.2%)** | **158.0 (-1.0%)** |
+| S2 | gumbel_topk scale=3.0 + spread + freeze | 148.0 (+4.5%) | 154.1 (+4.7%) | 159.9 (+4.5%) | 169.5 (+6.2%) |
+
+**Key findings:**
+
+1. **Init scale is the critical fix.** Scale 3.0 alone (S3) turns a +3.4% regression into a -0.6% improvement. Sigmoid [0.05, 0.95] eliminates the soft noise that was degrading training with scale 1.1.
+
+2. **Full fix package beats baseline by ~1% everywhere.** S1 (scale=3.0 + spread λ=0.01 + freeze=0.2) is the best config: -0.9% at full width and -1.0% at 1/8. The spread penalty and freeze provide incremental benefit on top of scale alone.
+
+3. **Gumbel noise is catastrophically bad with sharp masks.** S2 (gumbel_topk) is 4-6% worse than S1 (topk) with identical settings. Deterministic topk is strictly better when masks are already decisive — Gumbel noise just adds harmful variance to an already-sharp threshold.
+
+4. **The winning recipe:** `method=topk, init_scale=3.0, spread_penalty_lambda=0.01, gumbel_freeze_fraction=0.2`. This is ready for scale-up to Phase 2.4.
+
 ---
 
 ### Phase 2.3 Original Experimental Setup (archived)
@@ -1920,6 +1940,99 @@ Analysis (Group 4) runs post-hoc on CPU using saved checkpoints.
 | 4 | Does Gumbel noise help top-k? | A1-A4 | Helps at unbiased init, neutral at linspace |
 | 5 | Does the fix eliminate long-run degradation? | L1-L3 | Full-model gap drops from +9% to <1% |
 | 6 | Do neurons genuinely reorder now? | Group 4 analysis | Significantly more reordering than Phase 2's 97-99% preservation |
+
+---
+
+## Phase 2.3c: Fisher Saliency Re-Evaluation
+
+### Motivation
+
+The original Fisher saliency experiments (Phase 1 and Phase 2.1) ran **before** the masking fix in commit `e9b5ba3`. That fix changed `gumbel.py`, `model.py`, and `train.py` — correcting how masks are applied in the forward pass. This means all prior Fisher results are invalid: it's unknown whether Fisher underperformed due to the approach itself or the broken masking logic.
+
+Additionally, the current winning config (topk, `init_scale=3.0`) uses a **position-based linear decay** for initial logit ranking. Fisher saliency offers a **data-driven** alternative: initialize logit rankings from actual neuron importance scores. With the corrected masking and the sharp-init + topk recipe now established, Fisher can be tested as a drop-in replacement for the initialization strategy.
+
+### What to Test
+
+Three uses of Fisher saliency, in increasing complexity:
+
+**1. Fisher-informed initialization (simplest)**
+
+Use the vanilla warmup phase (first 15% of training) to accumulate Fisher EMA scores. At the transition to masked training, initialize topk logits from saliency rankings instead of linear decay:
+
+```
+# Instead of: logits = linspace(+scale, -scale, mlp_dim)
+# Use: logits[rank_by_fisher] = linspace(+scale, -scale, mlp_dim)
+```
+
+After initialization, training proceeds identically to the current topk recipe — logits are learned via backprop, no ongoing Fisher involvement.
+
+**Why this might help:** The current linspace init assigns importance by position (neuron 0 > neuron 1 > ... > neuron N). This is arbitrary. Fisher-informed init assigns importance by measured gradient magnitude, giving the optimizer a better starting point. With `init_scale=3.0` the initial ranking is highly persistent (Phase 2.3 showed ~97% overlap between init and final rankings), so a better initial ranking directly translates to a better final ranking.
+
+**2. Periodic Fisher re-ranking**
+
+Same as (1), but periodically (every K steps) re-rank logits using updated Fisher EMA scores. This was the Phase 2.1 design. Key difference from the original attempt: masks are now applied correctly, and we use deterministic topk instead of Gumbel noise.
+
+**Why this might help or hurt:** On one hand, ongoing re-ranking adapts to changing saliency as the model trains. On the other hand, it fights with gradient-based logit learning — the optimizer moves logits one direction, then Fisher resets them. The Phase 2.3b results showed that stable, sharp masks work best, so periodic re-ranking may introduce harmful instability.
+
+**3. Fisher-guided spread loss (lightest touch)**
+
+Instead of re-ranking, use Fisher scores to **weight** the spread penalty. Currently spread loss is `-var(logits)` uniformly. A Fisher-weighted version would penalize ambiguity more for high-saliency neurons (where the keep/prune decision matters most):
+
+```python
+weights = fisher_ema[layer] / fisher_ema[layer].sum()
+weighted_var = (weights * (logits - logits.mean()) ** 2).sum()
+loss = -weighted_var
+```
+
+This is the lightest integration — Fisher provides a signal but doesn't override the learned logits.
+
+### Experiment Design
+
+All runs use the Phase 2.3b winning config as baseline: `method=topk, init_scale=3.0, spread_penalty_lambda=0.01, gumbel_freeze_fraction=0.2, vanilla_warmup_frac=0.15`.
+
+| Run | Description | Change from baseline | Key question |
+|-----|-------------|---------------------|--------------|
+| F0 | Baseline (reuse S1 from 2.3b) | None — control | — |
+| F1 | Fisher-informed init, 15% warmup | `--hmat.fisher_init=true` | Does data-driven ordering beat positional? |
+| F2 | Fisher-informed init, 30% warmup | `--hmat.fisher_init=true --hmat.vanilla_warmup_frac=0.3` | Does more Fisher data improve the ranking? |
+| F3 | Fisher-weighted spread, best warmup from F1/F2 | `--hmat.fisher_init=true --hmat.fisher_weighted_spread=true` + best warmup | Should spread focus on important neurons? |
+
+540-step runs, ~92 min each × 3 = ~4.5 hours on 1 GPU.
+
+**Why periodic re-ranking was dropped:** Phase 2.3b showed that stability is critical with sharp masks — Gumbel noise (S2) was catastrophically bad. Periodic re-ranking is the same class of instability: it disrupts the learned logit ordering every K steps, even with optimizer reset. Predicted to hurt based on prior evidence. If Fisher init proves valuable, periodic re-ranking can be tested later at larger scale where the tradeoff may differ.
+
+**Why F2 (longer warmup) was added:** With 15% warmup (81 steps), Fisher EMA accumulates scores from a small window. The EMA β=0.99 has an effective window of ~100 steps, so 81 steps may produce noisy rankings. With 30% warmup (162 steps), Fisher gets 2× more gradient data for a more stable ranking. The tradeoff is fewer masked training steps (378 vs 459), but if the ranking quality is the bottleneck, it's worth testing.
+
+**Why F3 uses the best warmup from F1/F2:** F3 tests Fisher-weighted spread as an orthogonal improvement. To avoid confounding, it should use whichever warmup length won in the F1 vs F2 comparison. The script automatically picks the winner.
+
+### Implementation
+
+**New config fields** (`HMatConfig`):
+```python
+fisher_init: bool = False          # Accumulate Fisher during warmup, re-init logits at transition
+fisher_rerank_interval: int = 0    # Re-rank logits from Fisher every K steps (0 = init only)
+fisher_weighted_spread: bool = False  # Weight spread loss by Fisher saliency
+```
+
+**Code changes:**
+- `olmo/config.py`: Add three fields above
+- `olmo/train.py`:
+  - `init_topk()`: When `fisher_init=True`, create FisherEMA alongside TopKMaskManager
+  - `train_step()` warmup phase: Accumulate Fisher EMA from gradients during vanilla warmup
+  - `train_step()` warmup→mask transition: If `fisher_init`, call `fisher_ema.get_logits(scale=3.0)` and copy into topk logits via `mask.logits.copy_(fisher_logits)`
+  - `train_step()` post-warmup: If `fisher_rerank_interval > 0`, periodically re-rank
+- `olmo/hmat/topk.py`: Add `spread_loss(fisher_weights=None)` variant
+
+**CLI overrides for experiments:**
+- F1: `--hmat.fisher_init=true`
+- F2: `--hmat.fisher_init=true --hmat.fisher_rerank_interval=50`
+- F3: `--hmat.fisher_init=true --hmat.fisher_weighted_spread=true`
+
+### Success Criteria
+
+- F1 should show whether data-driven init beats positional init — even a small improvement validates the approach since it's zero-cost at training time (Fisher accumulates during warmup for free)
+- F2 is expected to hurt (based on the stability findings from 2.3b) but worth confirming
+- F3 is the speculative bet — if Fisher-weighted spread helps, it suggests the uniform spread penalty is suboptimal
 
 ---
 

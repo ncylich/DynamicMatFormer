@@ -138,6 +138,11 @@ class Trainer:
             state_dict["topk_manager"] = self.topk_manager.state_dict()
         if self.topk_optim is not None:
             state_dict["topk_optim"] = self.topk_optim.state_dict()
+        if self.fisher_ema is not None:
+            state_dict["fisher_ema"] = {
+                "scores": [s.cpu() for s in self.fisher_ema.scores],
+                "steps": self.fisher_ema.steps,
+            }
         return state_dict
 
     def non_tensor_state_dict(self) -> Dict[str, Any]:
@@ -378,6 +383,13 @@ class Trainer:
             if "topk_optim" in state_dict and self.topk_optim is not None:
                 log.info("Loading topk optimizer state...")
                 self.topk_optim.load_state_dict(state_dict["topk_optim"])
+
+            # Load Fisher EMA state if present.
+            if "fisher_ema" in state_dict and self.fisher_ema is not None:
+                log.info("Loading Fisher EMA state...")
+                fisher_state = state_dict["fisher_ema"]
+                self.fisher_ema.scores = [s.to(self.device) for s in fisher_state["scores"]]
+                self.fisher_ema.steps = fisher_state["steps"]
 
             del state_dict, flattened_osd
 
@@ -657,7 +669,11 @@ class Trainer:
                 if self.cfg.hmat.enabled and self.cfg.hmat.spread_penalty_lambda > 0 and not self._in_vanilla_warmup:
                     mask_mgr = self.gumbel_manager or self.topk_manager
                     if mask_mgr is not None:
-                        loss = loss + self.cfg.hmat.spread_penalty_lambda * mask_mgr.spread_loss() / len(micro_batches)
+                        fw = None
+                        if (self.cfg.hmat.fisher_weighted_spread and self.fisher_ema is not None
+                                and self.fisher_ema.steps > 0):
+                            fw = self.fisher_ema.scores
+                        loss = loss + self.cfg.hmat.spread_penalty_lambda * mask_mgr.spread_loss(fisher_weights=fw) / len(micro_batches)
 
                 del logits
 
@@ -687,6 +703,24 @@ class Trainer:
                 target = "gumbel" if self.cfg.hmat.method == "fisher_gumbel" else self.cfg.hmat.method
                 matmng.mode = target
                 log.info(f"Vanilla warmup complete at step {self.global_step}, enabling {target} masks")
+
+                # Fisher-informed init: re-init topk logits from Fisher rankings at transition
+                if (self.cfg.hmat.fisher_init and self.topk_manager is not None
+                        and self.fisher_ema is not None and self.fisher_ema.steps > 0):
+                    fisher_logits = self.fisher_ema.get_logits(
+                        scale=self.cfg.hmat.gumbel_init_scale, mode="rank")
+                    with torch.no_grad():
+                        for i, mask in enumerate(self.topk_manager.masks):
+                            mask.logits.copy_(fisher_logits[i].to(mask.logits.device))
+                    # Reset optimizer state since logits were replaced
+                    self.topk_optim = torch.optim.AdamW(
+                        self.topk_manager.parameters(),
+                        lr=self.cfg.optimizer.learning_rate,
+                        weight_decay=0.0,
+                        betas=tuple(self.cfg.optimizer.betas),
+                    )
+                    log.info(f"Fisher-informed init: re-initialized topk logits from "
+                             f"{self.fisher_ema.steps} steps of Fisher EMA")
 
         # Zero-gradients.
         self.optim.zero_grad(set_to_none=True)
@@ -773,27 +807,24 @@ class Trainer:
             ce_batch_loss = self.ce_train_loss_metric.compute()
             losses.append((ce_batch_loss, z_batch_loss))
 
-        # Fisher EMA update (Phase 2.5): accumulate from existing gradients before optimizer step (skip during warmup)
-        if self.fisher_ema is not None and self.cfg.hmat.method == "fisher_gumbel" and not self._in_vanilla_warmup:
+        # Fisher EMA update (Phase 2.5): accumulate from existing gradients (including during warmup)
+        if self.fisher_ema is not None and self.cfg.hmat.method == "fisher_gumbel":
             # Access the unwrapped model for gradient access
             unwrapped = self.fsdp_model.module if hasattr(self.fsdp_model, 'module') else self.fsdp_model
 
-            # #3 ablation: only accumulate Fisher from factor=1 passes
+            # Accumulate Fisher scores (including during warmup — that's the point)
             if not self.cfg.hmat.fisher_factor1_only:
                 self.fisher_ema.update(unwrapped)
-            # If factor1_only, accumulation happens in the factor loop (see below)
+            # If factor1_only, accumulation happens in the factor loop above
 
-            warmup_steps = int(self.cfg.hmat.fisher_warmup_frac * self.cfg.max_duration)
+            # Use vanilla_warmup_frac as the warmup (fisher_warmup_frac is deprecated in favor of it)
+            warmup_steps = int(self.cfg.hmat.vanilla_warmup_frac * self.cfg.max_duration) if self.cfg.hmat.vanilla_warmup_frac > 0 else int(self.cfg.hmat.fisher_warmup_frac * self.cfg.max_duration)
 
-            # After warmup: enable gumbel masking
-            if self.global_step == warmup_steps:
-                matmng = MatformerManager.get_instance()
-                matmng.mode = "gumbel"
-                log.info(f"Fisher-Gumbel warmup complete at step {self.global_step}, enabling masks")
+            # After warmup: enable gumbel masking (handled by vanilla warmup transition above)
 
-            # Update logits from Fisher EMA
+            # Update logits from Fisher EMA (only after warmup)
             update_interval = self.cfg.hmat.fisher_update_interval or 1  # 0 means every step
-            if (self.global_step >= warmup_steps and
+            if (not self._in_vanilla_warmup and self.global_step >= warmup_steps and
                     self.global_step % update_interval == 0):
                 new_logits = self.fisher_ema.get_logits(
                     scale=self.cfg.hmat.gumbel_init_scale,
@@ -809,6 +840,31 @@ class Trainer:
                             )
                     else:
                         mask_layer.set_logits(new_logits[i])
+
+        # Fisher EMA for topk: accumulate during warmup, periodic re-rank post-warmup
+        if (self.fisher_ema is not None and self.topk_manager is not None
+                and self.cfg.hmat.method == "topk" and self.cfg.hmat.fisher_init):
+            unwrapped = self.fsdp_model.module if hasattr(self.fsdp_model, 'module') else self.fsdp_model
+            if self._in_vanilla_warmup:
+                # Accumulate Fisher scores from gradients during warmup
+                self.fisher_ema.update(unwrapped)
+            elif self.cfg.hmat.fisher_rerank_interval > 0:
+                # Continue accumulating and periodically re-rank
+                self.fisher_ema.update(unwrapped)
+                if self.global_step % self.cfg.hmat.fisher_rerank_interval == 0:
+                    new_logits = self.fisher_ema.get_logits(
+                        scale=self.cfg.hmat.gumbel_init_scale, mode="rank")
+                    with torch.no_grad():
+                        for i, mask in enumerate(self.topk_manager.masks):
+                            mask.logits.copy_(new_logits[i].to(mask.logits.device))
+                    # Reset optimizer to clear stale momentum/variance from old logit values
+                    self.topk_optim = torch.optim.AdamW(
+                        self.topk_manager.parameters(),
+                        lr=self.cfg.optimizer.learning_rate,
+                        weight_decay=0.0,
+                        betas=tuple(self.cfg.optimizer.betas),
+                    )
+                    log.info(f"Fisher re-ranked topk logits at step {self.global_step} (optimizer reset)")
 
         # Clip gradient norms.
         grad_norm: Optional[float] = None
@@ -1138,6 +1194,16 @@ class Trainer:
             weight_decay=0.0,
             betas=tuple(self.cfg.optimizer.betas),
         )
+
+        # Initialize Fisher EMA if fisher_init is enabled (accumulates during warmup)
+        if self.cfg.hmat.fisher_init:
+            self.fisher_ema = FisherEMA(
+                n_layers=self.cfg.model.n_layers,
+                mlp_dim=mlp_dim,
+                beta=self.cfg.hmat.fisher_ema_beta,
+                device=self.device,
+            )
+            log.info(f"Fisher EMA enabled for topk init (accumulates during warmup)")
 
         matmng = MatformerManager.get_instance()
         if self.cfg.hmat.vanilla_warmup_frac > 0:

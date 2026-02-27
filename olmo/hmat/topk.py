@@ -10,7 +10,7 @@ Gradient signal concentrates on boundary neurons near the k-th threshold,
 rather than being spread across all neurons as in Gumbel-Sigmoid.
 """
 
-from typing import Dict
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -97,15 +97,24 @@ class TopKMaskManager(nn.Module):
         """Get the mask for a specific layer at a specific sub-model width."""
         return self.masks[layer_idx](k=k, tau=tau, hard=hard)
 
-    def spread_loss(self) -> torch.Tensor:
+    def spread_loss(self, fisher_weights: "Optional[List[torch.Tensor]]" = None) -> torch.Tensor:
         """
         Spread penalty: maximize logit variance to sharpen mask boundaries.
+
+        Args:
+            fisher_weights: Optional per-layer Fisher saliency weights. When provided,
+                computes Fisher-weighted variance (penalizes ambiguity more for important neurons).
 
         Returns negative mean per-layer variance (minimize this to maximize spread).
         """
         total = torch.tensor(0.0, device=self.masks[0].logits.device)
-        for m in self.masks:
-            total = total - torch.var(m.logits)
+        for i, m in enumerate(self.masks):
+            if fisher_weights is not None:
+                w = fisher_weights[i] / (fisher_weights[i].sum() + 1e-8)
+                weighted_var = (w * (m.logits - m.logits.mean()) ** 2).sum()
+                total = total - weighted_var
+            else:
+                total = total - torch.var(m.logits)
         return total / self.n_layers
 
     def get_layer_widths(self, k: int) -> Dict[int, int]:

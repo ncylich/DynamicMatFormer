@@ -473,6 +473,9 @@ class HMatConfig(BaseConfig):
     gumbel_init_mode: str = "linspace"  # "linspace" | "zeros" | "normal" | "constant"
     gumbel_init_value: float = 1.5  # Value for constant mode; std for normal mode
     spread_penalty_lambda: float = 0.0  # Weight for spread loss: -var(logits) per layer (sharpens mask boundary)
+    fisher_init: bool = False  # Accumulate Fisher during warmup, re-init logits at transition
+    fisher_rerank_interval: int = 0  # Re-rank logits from Fisher every K steps (0 = init only)
+    fisher_weighted_spread: bool = False  # Weight spread loss by Fisher saliency
     gumbel_freeze_fraction: float = 0.0  # Freeze masks + switch to hard for last X% of training
     vanilla_warmup_frac: float = 0.15  # Fraction of training to use vanilla (uniform) model before enabling masks
 

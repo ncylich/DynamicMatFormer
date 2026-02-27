@@ -42,11 +42,11 @@ class FisherEMA:
         """
         Accumulate Fisher scores from current gradients (call after backward).
 
-        Computes per-dimension saliency from ff_proj and ff_out gradients:
-            saliency[l][d] = ||grad(ff_proj.weight[d,:])||^2 + ||grad(ff_out.weight[:,d])||^2
+        Computes per-dimension saliency from ff_out gradients:
+            saliency[l][d] = ||grad(ff_out.weight[:,d])||^2
 
-        For activations with output_multiplier != 1 (e.g. SwiGLU), ff_proj has
-        more rows than ff_out columns. We accumulate from ff_out (post-activation dim).
+        Uses ff_out only (not ff_proj) because ff_out columns directly correspond
+        to post-activation dimensions — the same dimensions that masks operate on.
         """
         self.steps += 1
         for l, block in enumerate(model.transformer.blocks):
